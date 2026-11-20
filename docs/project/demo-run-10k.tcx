@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<TrainingCenterDatabase xmlns="http://www.garmin.com/xmlschemas/TrainingCenterDatabase/v2"><Activities><Activity Sport="Running"><Id>2026-11-20T02:00:00Z</Id>
+<Lap StartTime="2026-11-20T02:00:00Z"><TotalTimeSeconds>3000</TotalTimeSeconds><DistanceMeters>10000</DistanceMeters><Calories>500</Calories><Intensity>Active</Intensity><TriggerMethod>Manual</TriggerMethod><Track>
+<Trackpoint><Time>2026-11-20T02:00:00Z</Time><DistanceMeters>0</DistanceMeters><HeartRateBpm><Value>128</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:05:00Z</Time><DistanceMeters>1000</DistanceMeters><HeartRateBpm><Value>130</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:10:00Z</Time><DistanceMeters>2000</DistanceMeters><HeartRateBpm><Value>132</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:15:00Z</Time><DistanceMeters>3000</DistanceMeters><HeartRateBpm><Value>134</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:20:00Z</Time><DistanceMeters>4000</DistanceMeters><HeartRateBpm><Value>136</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:25:00Z</Time><DistanceMeters>5000</DistanceMeters><HeartRateBpm><Value>138</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:30:00Z</Time><DistanceMeters>6000</DistanceMeters><HeartRateBpm><Value>140</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:35:00Z</Time><DistanceMeters>7000</DistanceMeters><HeartRateBpm><Value>142</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:40:00Z</Time><DistanceMeters>8000</DistanceMeters><HeartRateBpm><Value>144</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:45:00Z</Time><DistanceMeters>9000</DistanceMeters><HeartRateBpm><Value>146</Value></HeartRateBpm></Trackpoint>
+<Trackpoint><Time>2026-11-20T02:50:00Z</Time><DistanceMeters>10000</DistanceMeters><HeartRateBpm><Value>148</Value></HeartRateBpm></Trackpoint>
+</Track></Lap><Notes>课程演示合成数据</Notes></Activity></Activities></TrainingCenterDatabase>

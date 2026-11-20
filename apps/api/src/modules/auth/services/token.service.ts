@@ -1,0 +1,92 @@
+import { randomUUID } from 'node:crypto';
+
+import { Injectable } from '@nestjs/common';
+
+import { TokenType } from '@openathlete/database';
+
+import {
+  PrismaService,
+  UserRow,
+} from 'src/modules/prisma/services/prisma.service';
+
+@Injectable()
+export class TokenService {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async _generateToken(): Promise<string> {
+    return randomUUID();
+  }
+
+  async _getExpiracy(type: TokenType): Promise<number> {
+    switch (type) {
+      case TokenType.PASSWORD_RESET:
+        return 60 * 15 * 1000; // 15 minutes;
+      case TokenType.ATHLETE_INVITATION:
+        return 60 * 60 * 24 * 7 * 1000; // 7 days;
+      case TokenType.COACH_INVITATION:
+        return 60 * 60 * 24 * 7 * 1000; // 7 days;
+      case TokenType.OIDC_LOGIN:
+        return 60 * 1000; // The web app exchanges it at once
+      default:
+        return 0;
+    }
+  }
+
+  async createToken(user: Pick<UserRow, 'userId'>, type: TokenType) {
+    const token = await this.prisma.token.create({
+      data: {
+        user: {
+          connect: user,
+        },
+        token: await this._generateToken(),
+        type,
+      },
+    });
+
+    return token;
+  }
+
+  /** The user of a valid token of that type: a token works for its purpose only */
+  async verifyToken(token: string, type: TokenType): Promise<UserRow | null> {
+    const tokenData = await this.prisma.token.findFirst({
+      where: {
+        token,
+        type,
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!tokenData) {
+      return null;
+    }
+
+    const expiracy = await this._getExpiracy(tokenData.type);
+    const now = new Date();
+    const tokenDate = new Date(tokenData.createdAt);
+    const diff = now.getTime() - tokenDate.getTime();
+    if (diff > expiracy) {
+      await this.prisma.token.delete({
+        where: {
+          tokenId: tokenData.tokenId,
+        },
+      });
+      return null;
+    }
+    return tokenData.user;
+  }
+
+  /**
+   * Like verifyToken, and the token is spent: of two requests with the same
+   * token, only one gets the user.
+   */
+  async consumeToken(token: string, type: TokenType): Promise<UserRow | null> {
+    const user = await this.verifyToken(token, type);
+    if (!user) return null;
+    const { count } = await this.prisma.token.deleteMany({
+      where: { token, type },
+    });
+    return count === 1 ? user : null;
+  }
+}

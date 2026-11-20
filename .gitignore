@@ -1,0 +1,62 @@
+# IDEs and editors
+.idea
+.project
+.classpath
+.c9/
+*.launch
+.settings/
+*.sublime-workspace
+
+# IDE - VSCode
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+!.vscode/openathlete.code-workspace
+.vscode
+
+# Docker compose local volumes
+volumes
+
+# CI/CD
+docker-compose.local.yml
+output.json
+.terraform
+
+# MISC
+.dccache
+scripts/**/assets
+.cache
+
+# OS
+**/.DS_Store
+
+# Tests
+**/coverage
+**/.nyc_output
+
+# App
+**/.env
+!**/.env.example
+**/node_modules
+**/dist
+*.env
+!*.env.example
+*.env.build
+files/
+
+# Terraform
+**/terraform.tfvars
+**/.terraform.lock.hcl
+**/terraform.tfstate.backup
+**/terraform.tfstate
+**/.terraform.tfstate.lock.info
+
+# Firebase
+GoogleService-Info.plist
+google-services.json
+
+lab
+repomix-output.xml
+.scannerwork

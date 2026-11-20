@@ -1,0 +1,657 @@
+import {
+  useDeleteEventMutation,
+  useDeleteEventSeriesMutation,
+  useDuplicateEventMutation,
+  useUnsetRelatedActivityMutation,
+} from '@/api/event';
+import { useCreateEventTemplateMutation } from '@/api/event-template';
+import { useIsEventValidated } from '@/hooks/use-event-validation';
+import { m } from '@/paraglide/messages';
+import { getLocale } from '@/paraglide/runtime';
+import { AnalyticsEvent } from '@/utils/analytics-events';
+import {
+  getEventTypeColor,
+  getHighSaturatedRpeColor,
+  getLowSaturatedRpeColor,
+  getSportColor,
+} from '@/utils/color';
+import { cn } from '@/utils/shadcn';
+import { useDraggable, useDroppable } from '@dnd-kit/core';
+import { useQueryClient } from '@tanstack/react-query';
+import {
+  ActivityIcon,
+  Copy,
+  Edit2,
+  FileText,
+  MessageCircle,
+  Repeat,
+  Trash2,
+  Trophy,
+  Unlink,
+} from 'lucide-react';
+import { usePostHog } from 'posthog-js/react';
+import { useCallback, useMemo, useState } from 'react';
+import { toast } from 'sonner';
+
+import {
+  CalendarDisplay,
+  EVENT_TYPE,
+  Event,
+  SPORT_TYPE,
+} from '@openathlete/shared';
+
+import { ConfirmAction } from '../confirm-action';
+import { garminActivityLabel } from '../garmin-attribution/garmin-source';
+import { SportIcon } from '../sport-icon/sport-icon';
+import { isStrengthSport } from '../strength/strength-sports';
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from '../ui/context-menu';
+import { CalendarEventTooltipWrapper } from './calendar-event-tooltip-wrapper';
+import { CompetitionPriorityBadge } from './competition-priority-badge';
+import { useBulkWorkoutSelection } from './contexts/bulk-workout-selection-context';
+import { useEventClipboard } from './contexts/event-clipboard-context';
+import { useEventContextMenu } from './contexts/event-context-menu-context';
+import { useCalendarContext } from './hooks/use-calendar-context';
+import { SeriesScopeDialog } from './series-scope-dialog';
+import { StrengthCardSummary } from './strength-card-summary';
+import { COLORED_BY } from './types/filter';
+import {
+  PlannedEvent,
+  complianceStripClass,
+  getCompliance,
+  isPlannedEvent,
+  isShownCompliance,
+} from './utils/compliance';
+import { complianceLabel } from './utils/compliance-labels';
+import { isActivityDrag, linkDropId } from './utils/link-drop';
+import { restoreDeleted } from './utils/restore-deleted';
+import { EDIT_KEY, isKeyHeld } from './utils/shortcuts';
+import { undoable } from './utils/undo';
+import {
+  formatCompactDuration,
+  formatCompactKilometers,
+} from './utils/week-summary';
+import { WorkoutMiniProfile } from './workout-mini-profile';
+
+interface P {
+  event: Event;
+  wrapped?: boolean;
+  detailed?: boolean;
+}
+
+const DISTANCE_SPORTS = new Set<SPORT_TYPE>([
+  SPORT_TYPE.RUNNING,
+  SPORT_TYPE.CYCLING,
+  SPORT_TYPE.TRAIL_RUNNING,
+  SPORT_TYPE.SWIMMING,
+  SPORT_TYPE.HIKING,
+]);
+
+/**
+ * The figures the user chose to see, done or planned. They wrap onto two
+ * lines when the card is narrow rather than running into each other.
+ */
+function EventMetrics({
+  event,
+  fields,
+}: {
+  event: Event;
+  fields: CalendarDisplay['card'];
+}) {
+  let duration: number | null | undefined;
+  let distance: number | null | undefined;
+  let elevation: number | null | undefined;
+  let load: number | null | undefined;
+  if (event.type === EVENT_TYPE.ACTIVITY) {
+    duration = event.movingTime;
+    distance = DISTANCE_SPORTS.has(event.sport) ? event.distance : null;
+    elevation = event.elevationGain;
+    load = event.trainingLoad;
+  } else if (isPlannedEvent(event)) {
+    duration = event.goalDuration;
+    distance = event.goalDistance;
+    elevation = event.goalElevationGain;
+    load = event.type === EVENT_TYPE.TRAINING ? event.estimatedLoad : null;
+  } else {
+    return null;
+  }
+  const parts = [
+    fields.duration && !!duration && formatCompactDuration(duration),
+    fields.distance &&
+      !!distance &&
+      `${formatCompactKilometers(distance, getLocale())} km`,
+    fields.elevation && !!elevation && `${Math.round(elevation)} m D+`,
+    fields.load && !!load && m.calendar_card_load({ load: Math.round(load) }),
+  ].filter((part): part is string => !!part);
+  if (!parts.length) return null;
+
+  return (
+    <div className="flex w-full flex-wrap justify-between gap-x-2 text-xs font-medium tabular-nums text-muted-foreground">
+      {parts.map((part) => (
+        <span key={part}>{part}</span>
+      ))}
+    </div>
+  );
+}
+
+/**
+ * What the week view adds to a card: when, how hard, and the start of the
+ * description, so a week reads without opening every session.
+ */
+function EventDetails({ event }: { event: Event }) {
+  const rpe =
+    event.type === EVENT_TYPE.ACTIVITY
+      ? event.rpe
+      : isPlannedEvent(event)
+        ? event.goalRpe
+        : null;
+  const description =
+    'description' in event ? event.description?.trim() : undefined;
+  const time = event.startDate.toLocaleTimeString(getLocale(), {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  const garminLabel = garminActivityLabel(event);
+
+  return (
+    <div className="w-full space-y-0.5 px-1 pb-0.5 text-xs text-muted-foreground">
+      <div className="flex flex-wrap gap-x-2 tabular-nums">
+        <span>{time}</span>
+        {rpe != null && (
+          <span>{m.calendar_card_rpe({ rpe: Math.round(rpe * 10) })}</span>
+        )}
+        {garminLabel && (
+          <span data-garmin-attribution="activity">{garminLabel}</span>
+        )}
+      </div>
+      {description && (
+        <p className="line-clamp-2 break-words" data-event-description>
+          {description}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Comments on the session, highlighted when some are unread */
+function CommentBadge({
+  counts,
+}: {
+  counts: ({ count: number; unread: number } | undefined)[];
+}) {
+  const count = counts.reduce((sum, entry) => sum + (entry?.count ?? 0), 0);
+  const unread = counts.reduce((sum, entry) => sum + (entry?.unread ?? 0), 0);
+  if (!count) return null;
+  const label = unread
+    ? m.calendar_card_comments_unread({ count, unread })
+    : m.calendar_card_comments({ count });
+  return (
+    <span
+      className={cn(
+        'mx-1 mb-0.5 inline-flex items-center gap-1 text-xs tabular-nums',
+        unread ? 'font-semibold text-primary' : 'text-muted-foreground',
+      )}
+      title={label}
+      data-comment-count={count}
+      data-comment-unread={unread || undefined}
+    >
+      <MessageCircle aria-hidden className="size-3" />
+      <span aria-hidden>{count}</span>
+      {unread > 0 && (
+        <span aria-hidden className="size-1.5 rounded-full bg-primary" />
+      )}
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
+
+export function CalendarEvent({ event, wrapped, detailed = false }: P) {
+  const posthog = usePostHog();
+  const bulk = useBulkWorkoutSelection();
+  const selectable = !!bulk?.selecting && bulk.eligible.has(event.eventId);
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    disabled: bulk?.selecting,
+    id: event.eventId,
+    data: {
+      type: 'event',
+      event,
+    },
+  });
+  const {
+    openEventDetails,
+    editEvent,
+    events: allEvents,
+    coloredBy,
+    athleteId,
+    display,
+    commentCounts,
+  } = useCalendarContext();
+  const compact = display.density === 'compact' && !detailed;
+  const [deleteEventDialog, setDeleteEventDialog] = useState<boolean>(false);
+  const queryClient = useQueryClient();
+  // Hook options, not mutate callbacks: the card is gone once deleted
+  const deleteEventMutation = useDeleteEventMutation({
+    onSuccess: () => {
+      posthog?.capture(AnalyticsEvent.event_deleted, {
+        event_type: event.type,
+      });
+      // A plan can come back; an activity comes from its device
+      if (event.type !== EVENT_TYPE.ACTIVITY) {
+        undoable(m.calendar_items_deleted({ count: 1 }), () =>
+          restoreDeleted(queryClient, [event]),
+        );
+      }
+    },
+  });
+  const deleteSeriesMutation = useDeleteEventSeriesMutation({
+    onSuccess: ({ deleted }) => {
+      // What the API deleted: this occurrence and the following ones to do
+      const occurrences = allEvents.filter(
+        (other) =>
+          other.seriesId === event.seriesId &&
+          other.startDate >= event.startDate &&
+          (other.eventId === event.eventId ||
+            !isPlannedEvent(other) ||
+            !other.relatedActivity),
+      );
+      undoable(m.calendar_items_deleted({ count: deleted }), () =>
+        restoreDeleted(queryClient, occurrences),
+      );
+    },
+    onError: () => toast.error(m.failed_to_delete_event()),
+  });
+  const duplicateEventMutation = useDuplicateEventMutation({
+    onSuccess: (duplicated) => {
+      posthog?.capture(AnalyticsEvent.event_duplicated, {
+        event_type: duplicated.type,
+      });
+    },
+  });
+  const createEventTemplateMutation = useCreateEventTemplateMutation({
+    onSuccess: () => {
+      posthog?.capture(AnalyticsEvent.event_template_saved, {
+        from: 'calendar_menu',
+      });
+      toast.success(m.template_saved_successfully());
+    },
+  });
+  const unsetRelatedActivityMutation = useUnsetRelatedActivityMutation();
+  const unlinkActivity = (sessionId: Event['eventId']) =>
+    unsetRelatedActivityMutation.mutate(sessionId, {
+      onSuccess: () => toast.success(m.calendar_unlink_done()),
+      onError: () => toast.error(m.calendar_link_failed()),
+    });
+  const isValidated = useIsEventValidated(event, athleteId);
+  const { copyEvent } = useEventClipboard();
+  const { isAnyContextMenuOpen, setContextMenuOpen } = useEventContextMenu();
+
+  const eventColor = useMemo(() => {
+    switch (coloredBy || COLORED_BY.TYPE) {
+      case COLORED_BY.TYPE:
+        return getEventTypeColor(event.type);
+      case COLORED_BY.SPORT: {
+        const sport = event.type !== EVENT_TYPE.NOTE ? event.sport : null;
+        if (sport === null)
+          return 'bg-gray-50 hover:bg-gray-100 dark:bg-gray-900/40 dark:hover:bg-gray-800/50 border-border/50';
+        return getSportColor(sport);
+      }
+      case COLORED_BY.RPE: {
+        const rpe =
+          event.type === EVENT_TYPE.ACTIVITY
+            ? event.rpe
+            : event.type === EVENT_TYPE.TRAINING ||
+                event.type === EVENT_TYPE.COMPETITION
+              ? event.goalRpe
+              : null;
+        if (rpe === null)
+          return 'bg-gray-50 hover:bg-gray-100 dark:bg-gray-900/40 dark:hover:bg-gray-800/50 border-border/50';
+        return getLowSaturatedRpeColor(rpe);
+      }
+    }
+  }, [event, coloredBy]);
+
+  // While selecting, the event is not draggable: dnd-kit would still mark it
+  // aria-disabled, and with it the selection checkbox inside. Activities are
+  // dragged onto their planned session to link them.
+  const draggable = !wrapped && !bulk?.selecting;
+  // A planned session still waiting for its activity takes one by drop
+  const linkTarget =
+    isPlannedEvent(event) && !event.relatedActivity && !wrapped;
+  const {
+    setNodeRef: setDropRef,
+    isOver: isLinkOver,
+    active: activeDrag,
+  } = useDroppable({
+    id: linkDropId(event.eventId),
+    disabled: !linkTarget,
+  });
+  const awaitsActivity = linkTarget && isActivityDrag(activeDrag);
+  const setCardRef = useCallback(
+    (node: HTMLElement | null) => {
+      if (draggable) setNodeRef(node);
+      setDropRef(node);
+    },
+    [draggable, setNodeRef, setDropRef],
+  );
+  const relatedEvents = allEvents.filter(
+    (e): e is PlannedEvent =>
+      isPlannedEvent(e) && e.relatedActivity?.eventId === event.eventId,
+  );
+  // A done session shows as its activity, so the activity carries the strip
+  const plannedEvent = isPlannedEvent(event) ? event : relatedEvents[0];
+  const compliance =
+    plannedEvent && !wrapped ? getCompliance(plannedEvent) : undefined;
+  const shownCompliance = isShownCompliance(compliance)
+    ? compliance
+    : undefined;
+  return (
+    <>
+      <ContextMenu
+        onOpenChange={(open) => {
+          setContextMenuOpen(event.eventId, open);
+        }}
+      >
+        <ContextMenuTrigger className="w-full">
+          <CalendarEventTooltipWrapper
+            event={event}
+            compliance={compliance}
+            disabled={isDragging || isAnyContextMenuOpen || bulk?.selecting}
+          >
+            <div
+              className={cn(
+                'calendar-event rounded-sm cursor-pointer text-left flex flex-col items-start justify-center py-0.5 px-1 overflow-hidden w-full',
+                eventColor,
+                wrapped ? 'border-2' : '',
+                shownCompliance &&
+                  cn(
+                    'border-l-4',
+                    complianceStripClass[shownCompliance.status],
+                  ),
+                !isValidated ? 'opacity-60' : '',
+                isDragging ? 'opacity-30' : '',
+                awaitsActivity &&
+                  'outline-2 outline-offset-1 outline-dashed outline-primary/50 transition-transform',
+                awaitsActivity &&
+                  isLinkOver &&
+                  'scale-[1.03] bg-primary/10 outline-solid outline-primary',
+                selectable &&
+                  bulk?.selected.has(event.eventId) &&
+                  'ring-2 ring-inset ring-primary',
+              )}
+              ref={setCardRef}
+              data-compliance={shownCompliance?.status}
+              {...(draggable ? { ...listeners, ...attributes } : {})}
+              onClick={(e) => {
+                if (bulk?.selecting) {
+                  if (selectable) bulk.toggle(event.eventId);
+                } else if (isKeyHeld(EDIT_KEY)) {
+                  // E + click goes straight to editing
+                  editEvent(event.eventId);
+                } else openEventDetails(event.eventId);
+                e.stopPropagation();
+              }}
+              onMouseEnter={(e) => {
+                if (wrapped) {
+                  e.stopPropagation();
+                }
+              }}
+              onMouseLeave={(e) => {
+                if (wrapped) {
+                  e.stopPropagation();
+                }
+              }}
+            >
+              {selectable && (
+                <label
+                  className="flex items-center min-h-11 gap-2 px-1 text-sm"
+                  onClick={(e) => e.stopPropagation()}
+                  onPointerDown={(e) => e.stopPropagation()}
+                >
+                  <input
+                    type="checkbox"
+                    className="size-5 accent-primary"
+                    checked={bulk.selected.has(event.eventId)}
+                    disabled={bulk.busy}
+                    onChange={() => bulk.toggle(event.eventId)}
+                    aria-label={m.bulk_workouts_toggle({ name: event.name })}
+                  />
+                  {m.bulk_workouts_toggle({ name: event.name })}
+                </label>
+              )}
+              <div
+                className={cn(
+                  'font-medium px-1 break-words',
+                  compact ? 'text-xs line-clamp-1' : 'text-[13px]',
+                  // Two lines in narrow day cells rather than a few letters
+                  detailed ? 'whitespace-normal' : !compact && 'line-clamp-2',
+                )}
+              >
+                {event.type !== EVENT_TYPE.NOTE && (
+                  <SportIcon
+                    sport={event.sport}
+                    className="inline-block mr-1"
+                  />
+                )}
+                {event.seriesId && (
+                  <Repeat
+                    className="inline-block mr-1 size-3 text-muted-foreground"
+                    role="img"
+                    aria-label={m.series_badge()}
+                  />
+                )}
+                {event.type === EVENT_TYPE.COMPETITION && (
+                  <CompetitionPriorityBadge
+                    priority={event.priority}
+                    className="mr-1 align-text-bottom"
+                  />
+                )}
+                {event.type === EVENT_TYPE.ACTIVITY && event.isRace && (
+                  <Trophy
+                    className="inline-block h-3.5 w-3.5 mr-1 text-amber-500"
+                    aria-label={m.activity_race_badge()}
+                  />
+                )}
+                {event.type === EVENT_TYPE.ACTIVITY && event.rpe !== null && (
+                  <div
+                    className={cn(
+                      'h-2 w-2 rounded-full inline-block mr-1',
+                      getHighSaturatedRpeColor(event.rpe),
+                    )}
+                  />
+                )}
+                {(event.type === EVENT_TYPE.TRAINING ||
+                  event.type === EVENT_TYPE.COMPETITION) &&
+                  event.goalRpe !== null && (
+                    <div
+                      className={cn(
+                        'h-2 w-2 rounded-full inline-block mr-1',
+                        getHighSaturatedRpeColor(event.goalRpe),
+                      )}
+                    />
+                  )}
+                {!display.card.profile &&
+                  event.type === EVENT_TYPE.TRAINING &&
+                  'workout' in event &&
+                  event.workout &&
+                  event.workout.steps.length > 0 && (
+                    <ActivityIcon className="inline-block w-3 h-3 mr-1 text-muted-foreground" />
+                  )}
+                {event.name}
+              </div>
+              {display.card.profile &&
+                event.type === EVENT_TYPE.TRAINING &&
+                !!event.workout?.steps.length &&
+                isStrengthSport(event.sport) && (
+                  <StrengthCardSummary steps={event.workout.steps} />
+                )}
+              {display.card.profile &&
+                event.type === EVENT_TYPE.TRAINING &&
+                !!event.workout?.steps.length &&
+                !isStrengthSport(event.sport) && (
+                  <div
+                    className={cn('w-full px-1', compact ? 'py-0' : 'py-0.5')}
+                  >
+                    <WorkoutMiniProfile
+                      steps={event.workout.steps}
+                      sport={event.sport}
+                      athleteId={event.athleteId}
+                      className={
+                        compact ? 'h-1.5' : detailed ? 'h-4' : undefined
+                      }
+                    />
+                  </div>
+                )}
+              <div className="px-1 w-full">
+                <EventMetrics event={event} fields={display.card} />
+              </div>
+              {detailed && !wrapped && <EventDetails event={event} />}
+              {!wrapped && (
+                <CommentBadge
+                  // A done session shows as its activity: both threads count
+                  counts={[event, ...relatedEvents].map(
+                    (item) => commentCounts[item.eventId],
+                  )}
+                />
+              )}
+              {shownCompliance && (
+                <span className="sr-only">
+                  {complianceLabel[shownCompliance.status]()}
+                </span>
+              )}
+              {relatedEvents.length > 0 && (
+                <div className="flex flex-col gap-1 mt-1 w-full mb-0.5">
+                  {relatedEvents.map((relatedEvent) => (
+                    <CalendarEvent
+                      key={relatedEvent.eventId}
+                      event={relatedEvent}
+                      wrapped
+                    />
+                  ))}
+                </div>
+              )}
+            </div>
+          </CalendarEventTooltipWrapper>
+        </ContextMenuTrigger>
+        {!bulk?.selecting && (
+          <ContextMenuContent>
+            <ContextMenuItem
+              onClick={(e) => {
+                editEvent(event.eventId);
+                e.stopPropagation();
+              }}
+            >
+              <Edit2 className="w-4 h-4 mr-2" />
+              {m.edit()}
+            </ContextMenuItem>
+            {event.type === EVENT_TYPE.TRAINING && (
+              <ContextMenuItem
+                onClick={(e) => {
+                  createEventTemplateMutation.mutate({
+                    eventId: event.eventId,
+                  });
+                  e.stopPropagation();
+                }}
+              >
+                <FileText className="w-4 h-4 mr-2" />
+                {m.save_as_template()}
+              </ContextMenuItem>
+            )}
+            {isPlannedEvent(event) && event.relatedActivity && (
+              <ContextMenuItem
+                onClick={(e) => {
+                  unlinkActivity(event.eventId);
+                  e.stopPropagation();
+                }}
+              >
+                <Unlink className="w-4 h-4 mr-2" />
+                {m.calendar_unlink_activity()}
+              </ContextMenuItem>
+            )}
+            {relatedEvents.map((related) => (
+              <ContextMenuItem
+                key={related.eventId}
+                onClick={(e) => {
+                  unlinkActivity(related.eventId);
+                  e.stopPropagation();
+                }}
+              >
+                <Unlink className="w-4 h-4 mr-2" />
+                {m.calendar_unlink_from({ name: related.name })}
+              </ContextMenuItem>
+            ))}
+            {event.type !== EVENT_TYPE.ACTIVITY && (
+              <>
+                <ContextMenuItem
+                  onClick={(e) => {
+                    duplicateEventMutation.mutate({ eventId: event.eventId });
+                    e.stopPropagation();
+                  }}
+                >
+                  <Copy className="w-4 h-4 mr-2" />
+                  {m.duplicate()}
+                </ContextMenuItem>
+                <ContextMenuSeparator />
+                <ContextMenuItem
+                  onClick={(e) => {
+                    copyEvent(event);
+                    e.stopPropagation();
+                  }}
+                >
+                  <Copy className="w-4 h-4 mr-2" />
+                  {m.copy()}
+                </ContextMenuItem>
+              </>
+            )}
+            <ContextMenuSeparator />
+            <ContextMenuItem
+              variant="destructive"
+              onClick={(e) => {
+                setDeleteEventDialog(true);
+                e.stopPropagation();
+              }}
+            >
+              <Trash2 className="w-4 h-4 mr-2" />
+              {m.delete_()}
+            </ContextMenuItem>
+          </ContextMenuContent>
+        )}
+      </ContextMenu>
+      {event.seriesId ? (
+        // A repeated session asks its scope instead of a confirmation
+        <SeriesScopeDialog
+          open={deleteEventDialog}
+          action="delete"
+          onCancel={() => setDeleteEventDialog(false)}
+          onChoose={(scope) => {
+            if (scope === 'following') {
+              deleteSeriesMutation.mutate(event.eventId);
+            } else {
+              deleteEventMutation.mutate(event.eventId);
+            }
+            setDeleteEventDialog(false);
+          }}
+          isLoading={
+            deleteEventMutation.isPending || deleteSeriesMutation.isPending
+          }
+        />
+      ) : (
+        <ConfirmAction
+          open={deleteEventDialog}
+          onClose={() => setDeleteEventDialog(false)}
+          onConfirm={() => {
+            deleteEventMutation.mutate(event.eventId);
+            setDeleteEventDialog(false);
+          }}
+          title={m.delete_event()}
+          message={m.confirm_delete_event()}
+          isLoading={deleteEventMutation.isPending}
+        />
+      )}
+    </>
+  );
+}

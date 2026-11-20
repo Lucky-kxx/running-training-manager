@@ -1,0 +1,101 @@
+import { Module } from '@nestjs/common';
+import { ConfigModule } from '@nestjs/config';
+import { APP_FILTER, APP_GUARD } from '@nestjs/core';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+import { ThrottlerModule } from '@nestjs/throttler';
+
+import { validateEnv } from 'src/common/config/validate-env';
+import { AppThrottlerGuard } from 'src/common/security/app-throttler.guard';
+import { DEFAULT_RATE_LIMIT } from 'src/common/security/rate-limits';
+import {
+  ActivityFeedbackExtractionListener,
+  ActivityFeedbackListener,
+  ActivityPushNotificationListener,
+  NotificationListener,
+  ProviderDeregistrationListener,
+  TrainingLoadListener,
+  TrainingLoadRecalcListener,
+  WorkoutSyncListener,
+} from 'src/listeners';
+
+import { AgentModule } from './agent/agent.module';
+import { AiModule } from './ai';
+import { AnalyticsModule } from './analytics/analytics.module';
+import { ExceptionReportingFilter } from './analytics/exception.filter';
+import { AppController } from './app.controller';
+import { AuthModule } from './auth';
+import { CalendarModule } from './calendar/calendar.module';
+import { ClubModule } from './club/club.module';
+import { CoreModule } from './core';
+import { InstanceModule } from './instance/instance.module';
+import { McpModule } from './mcp/mcp.module';
+import { MessagesModule } from './messages/messages.module';
+import { NotificationModule } from './notification';
+import { PrismaModule } from './prisma/prisma.module';
+import { ProvidersSyncModule } from './providers-sync/providers-sync.module';
+import { QueueModule } from './queue';
+import { SeoPlanModule } from './seo/seo-plan.module';
+import { FilesModule } from './stored-files/files.module';
+import { StorageModule } from './stored-files/storage.module';
+import { SubscriptionModule } from './subscription';
+
+@Module({
+  imports: [
+    PrismaModule,
+    StorageModule,
+    FilesModule,
+    AnalyticsModule,
+    ConfigModule.forRoot({
+      isGlobal: true,
+      validate: validateEnv,
+      validationOptions: {
+        allowUnknown: false,
+        abortEarly: false,
+      },
+    }),
+    ThrottlerModule.forRoot(DEFAULT_RATE_LIMIT),
+    AuthModule,
+    CoreModule,
+    InstanceModule,
+    AgentModule,
+    AiModule,
+    McpModule,
+    MessagesModule,
+    CalendarModule,
+    ClubModule,
+    EventEmitterModule.forRoot(),
+    NotificationModule,
+    ProvidersSyncModule,
+    QueueModule,
+    SeoPlanModule,
+    SubscriptionModule,
+  ],
+  controllers: [AppController],
+  providers: [
+    {
+      provide: APP_FILTER,
+      useClass: ExceptionReportingFilter,
+    },
+    {
+      provide: APP_GUARD,
+      useClass: AppThrottlerGuard,
+    },
+    NotificationListener,
+    // Only register listeners that depend on activity processing
+    // if ENABLE_ACTIVITY_PROCESSING is true so they run on the same instances.
+    // Note: We use process.env here because ConfigService is not available
+    // at module definition time. The value is validated by envValidationSchema.
+    ...(process.env.ENABLE_ACTIVITY_PROCESSING === 'true'
+      ? [
+          TrainingLoadListener,
+          ActivityFeedbackListener,
+          ActivityPushNotificationListener,
+        ]
+      : []),
+    ActivityFeedbackExtractionListener,
+    ProviderDeregistrationListener,
+    WorkoutSyncListener,
+    TrainingLoadRecalcListener,
+  ],
+})
+export class AppModule {}

@@ -1,0 +1,444 @@
+import {
+  useCancelSubscription,
+  useCreateCheckout,
+  useCurrentSubscription,
+  useCustomerPortal,
+  useInvoices,
+  useResumeSubscription,
+} from '@/api/subscription';
+import { ConfirmAction } from '@/components/confirm-action';
+import {
+  SupporterOffer,
+  TierPicker,
+} from '@/components/paywall/supporter-offer';
+import { SupporterGoal } from '@/components/supporter/supporter-goal';
+import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
+import { m } from '@/paraglide/messages';
+import { AnalyticsEvent } from '@/utils/analytics-events';
+import { manageAppStoreSubscription } from '@/utils/app-store';
+import { purchaseChannel } from '@/utils/capacitor';
+import {
+  featuredSupporterTier,
+  sameTierIn,
+  supporterPriceLabel,
+  supporterTiers,
+} from '@/utils/supporter';
+import {
+  SettingsEmpty,
+  SettingsPanel,
+  SettingsRow,
+  SettingsSection,
+} from '@/views/dashboard/settings-view/settings-section';
+import { format } from 'date-fns';
+import { Download, ExternalLink, FileText } from 'lucide-react';
+import { usePostHog } from 'posthog-js/react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
+import { toast } from 'sonner';
+
+import {
+  BillingInterval,
+  BillingProvider,
+  FREE_PLAN_MAX_ATHLETES,
+  SubscriptionPlan,
+  SubscriptionStatus,
+} from '@openathlete/shared';
+
+const subscriptionStatusMap: Record<SubscriptionStatus, string> = {
+  [SubscriptionStatus.ACTIVE]: m.subscription_status_active(),
+  [SubscriptionStatus.TRIALING]: m.subscription_status_trialing(),
+  [SubscriptionStatus.CANCELED]: m.subscription_status_canceled(),
+  [SubscriptionStatus.PAST_DUE]: m.subscription_status_past_due(),
+  [SubscriptionStatus.INCOMPLETE]: m.subscription_status_incomplete(),
+  [SubscriptionStatus.INCOMPLETE_EXPIRED]:
+    m.subscription_status_incomplete_expired(),
+  [SubscriptionStatus.UNPAID]: m.subscription_status_unpaid(),
+};
+
+const invoiceStatusMap: Record<string, string> = {
+  paid: m.invoice_status_paid(),
+  open: m.invoice_status_open(),
+  draft: m.invoice_status_draft(),
+  void: m.invoice_status_void(),
+  uncollectible: m.invoice_status_uncollectible(),
+};
+
+function isSubscriptionActive(status: SubscriptionStatus): boolean {
+  return (
+    status === SubscriptionStatus.ACTIVE ||
+    status === SubscriptionStatus.TRIALING
+  );
+}
+
+export function SubscriptionSettingsPage() {
+  const { data: subscription, isLoading } = useCurrentSubscription();
+  const { data: invoices } = useInvoices();
+  const cancelMutation = useCancelSubscription();
+  const resumeMutation = useResumeSubscription();
+  const portalMutation = useCustomerPortal();
+  const createCheckout = useCreateCheckout();
+  const posthog = usePostHog();
+
+  // Back from Stripe. Having paid is reported by the webhook; leaving the
+  // payment page is known only here
+  const [searchParams] = useSearchParams();
+  const leftCheckout = searchParams.get('canceled') === 'true';
+  useEffect(() => {
+    if (leftCheckout) posthog.capture(AnalyticsEvent.checkout_abandoned);
+  }, [leftCheckout, posthog]);
+
+  const [isLoadingPortal, setIsLoadingPortal] = useState(false);
+  const [cancelOpen, setCancelOpen] = useState(false);
+  const channel = purchaseChannel();
+
+  const handleManageBilling = async () => {
+    setIsLoadingPortal(true);
+    try {
+      posthog?.capture(AnalyticsEvent.subscription_manage_billing_opened);
+      const returnUrl = `${window.location.origin}/dashboard/settings?tab=subscription`;
+      const { url } = await portalMutation.mutateAsync(returnUrl);
+      window.location.href = url;
+    } catch {
+      toast.error(m.subscription_portal_error());
+      setIsLoadingPortal(false);
+    }
+  };
+
+  const handleCancel = async () => {
+    try {
+      await cancelMutation.mutateAsync();
+      posthog?.capture('subscription_cancelled');
+      toast.success(m.subscription_cancel_success());
+      setCancelOpen(false);
+    } catch {
+      toast.error(m.subscription_cancel_error());
+    }
+  };
+
+  const handleResume = async () => {
+    try {
+      await resumeMutation.mutateAsync();
+      posthog?.capture('subscription_resumed');
+      toast.success(m.subscription_resume_success());
+    } catch {
+      toast.error(m.subscription_resume_error());
+    }
+  };
+
+  if (isLoading) {
+    return <div>{m.loading()}</div>;
+  }
+
+  if (!subscription) {
+    return <div>{m.subscription_not_found()}</div>;
+  }
+
+  const plan = subscription.plan as SubscriptionPlan;
+  const status = subscription.status as SubscriptionStatus;
+  const interval = subscription.billingInterval;
+
+  // A lapsed Supporter subscription leaves the free plan
+  if (plan === SubscriptionPlan.FREE || !isSubscriptionActive(status)) {
+    // The Android app neither sells nor points to a way to buy
+    if (channel === null) {
+      return (
+        <SettingsSection
+          title={m.subscription_free_title()}
+          description={m.subscription_unavailable_in_app()}
+        />
+      );
+    }
+    return (
+      <SettingsSection
+        title={m.subscription_free_title()}
+        description={m.subscription_free_description({
+          count: FREE_PLAN_MAX_ATHLETES,
+        })}
+      >
+        <SupporterGoal />
+        <SupporterOffer
+          analyticsSource="subscription_settings"
+          className="rounded-2xl"
+        />
+      </SettingsSection>
+    );
+  }
+
+  const billedByAppStore = subscription.provider === BillingProvider.APPLE;
+  // Stripe is managed on the web only; the App Store in the iOS app, and the
+  // web says where. The other apps show the subscription without managing it
+  const managesStripe = channel === 'stripe' && !billedByAppStore;
+  const managesAppStore = channel === 'app-store' && billedByAppStore;
+
+  return (
+    <div className="space-y-8">
+      <SettingsSection
+        title={m.subscription_current()}
+        description={m.subscription_supporter_thanks()}
+      >
+        <SettingsPanel>
+          <SettingsRow
+            title={m.subscription_plan()}
+            description={
+              subscription.isFounder && m.subscription_founder_description()
+            }
+          >
+            <span className="flex flex-wrap items-center justify-end gap-2 text-sm text-muted-foreground">
+              {subscription.isFounder && (
+                <Badge variant="secondary">
+                  {m.subscription_founder_badge()}
+                </Badge>
+              )}
+              {m.plan_supporter_name()}
+              {interval &&
+                ` · ${
+                  // Apple bills its own price point; the store shows it
+                  billedByAppStore || subscription.amountCents === null
+                    ? interval === BillingInterval.YEAR
+                      ? m.supporter_interval_yearly()
+                      : m.supporter_interval_monthly()
+                    : supporterPriceLabel(interval, subscription.amountCents)
+                }`}
+            </span>
+          </SettingsRow>
+          <SettingsRow title={m.subscription_status()}>
+            <span className="text-sm text-muted-foreground">
+              {subscriptionStatusMap[
+                subscription.status as SubscriptionStatus
+              ] || subscription.status}
+            </span>
+          </SettingsRow>
+          {subscription.currentPeriodStart && subscription.currentPeriodEnd && (
+            <SettingsRow
+              title={m.subscription_period()}
+              description={
+                subscription.cancelAtPeriodEnd && (
+                  <span className="text-orange-600">
+                    {m.subscription_cancel_at_period_end()}
+                  </span>
+                )
+              }
+            >
+              <span className="text-sm text-muted-foreground">
+                {format(new Date(subscription.currentPeriodStart), 'PP')} -{' '}
+                {format(new Date(subscription.currentPeriodEnd), 'PP')}
+              </span>
+            </SettingsRow>
+          )}
+        </SettingsPanel>
+
+        {channel === 'stripe' && billedByAppStore && (
+          <p className="px-1 text-sm text-muted-foreground">
+            {m.subscription_managed_by_app_store()}
+          </p>
+        )}
+
+        {managesAppStore && (
+          <Button
+            variant="outline"
+            onClick={() => manageAppStoreSubscription()}
+            className="w-full sm:w-auto"
+          >
+            {m.subscription_manage_app_store()}
+          </Button>
+        )}
+
+        {managesStripe && (
+          <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+            <Button
+              variant="outline"
+              onClick={handleManageBilling}
+              disabled={isLoadingPortal}
+              className="w-full sm:w-auto"
+            >
+              <ExternalLink className="size-4" />
+              {m.subscription_manage_billing()}
+            </Button>
+            {subscription.cancelAtPeriodEnd ? (
+              <Button
+                onClick={handleResume}
+                disabled={resumeMutation.isPending}
+                className="w-full sm:w-auto"
+              >
+                {m.subscription_resume()}
+              </Button>
+            ) : (
+              <Button
+                variant="ghost"
+                onClick={() => setCancelOpen(true)}
+                disabled={cancelMutation.isPending}
+                className="w-full text-destructive-foreground sm:ml-auto sm:w-auto"
+              >
+                {m.subscription_cancel()}
+              </Button>
+            )}
+          </div>
+        )}
+        <SupporterGoal />
+      </SettingsSection>
+
+      {managesStripe && interval && !subscription.cancelAtPeriodEnd && (
+        <ChangeContribution
+          interval={interval}
+          amountCents={subscription.amountCents}
+          isFounder={subscription.isFounder}
+          onChange={async (next) => {
+            const settingsUrl = `${window.location.origin}/dashboard/settings?tab=subscription`;
+            try {
+              await createCheckout.mutateAsync({
+                ...next,
+                successUrl: settingsUrl,
+                cancelUrl: settingsUrl,
+              });
+              posthog?.capture('subscription_tier_changed', {
+                interval: next.interval,
+                amount_cents: next.amountCents,
+              });
+              toast.success(m.subscription_switch_success());
+            } catch {
+              toast.error(m.subscription_checkout_error());
+            }
+          }}
+          isPending={createCheckout.isPending}
+        />
+      )}
+
+      {managesStripe && (
+        <SettingsSection title={m.subscription_invoices()}>
+          {!invoices || invoices.length === 0 ? (
+            <SettingsEmpty>{m.subscription_no_invoices()}</SettingsEmpty>
+          ) : (
+            <SettingsPanel>
+              {invoices.map((invoice) => (
+                <SettingsRow
+                  key={invoice.id}
+                  leading={<FileText className="size-5" />}
+                  title={`€${invoice.amount.toFixed(2)} ${invoice.currency.toUpperCase()}`}
+                  description={`${format(new Date(invoice.createdAt), 'PP')} - ${
+                    invoiceStatusMap[invoice.status.toLowerCase()] ||
+                    invoice.status
+                  }`}
+                >
+                  {invoice.invoiceUrl && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="max-md:w-11"
+                      aria-label={m.subscription_view_invoice()}
+                      onClick={() => window.open(invoice.invoiceUrl!, '_blank')}
+                    >
+                      <ExternalLink className="size-4" />
+                    </Button>
+                  )}
+                  {invoice.invoicePdf && (
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="max-md:w-11"
+                      aria-label={m.subscription_download_invoice()}
+                      onClick={() => window.open(invoice.invoicePdf!, '_blank')}
+                    >
+                      <Download className="size-4" />
+                    </Button>
+                  )}
+                </SettingsRow>
+              ))}
+            </SettingsPanel>
+          )}
+        </SettingsSection>
+      )}
+      <ConfirmAction
+        open={cancelOpen}
+        onClose={() => setCancelOpen(false)}
+        onConfirm={handleCancel}
+        title={m.subscription_cancel()}
+        message={m.subscription_cancel_confirm()}
+        isLoading={cancelMutation.isPending}
+      />
+    </div>
+  );
+}
+
+/**
+ * Another tier or interval for a Stripe Supporter, at once and prorated.
+ * A founder may leave their old price; they stay a founder.
+ */
+function ChangeContribution({
+  interval,
+  amountCents,
+  isFounder,
+  onChange,
+  isPending,
+}: {
+  interval: BillingInterval;
+  amountCents: number | null;
+  isFounder: boolean;
+  onChange: (next: {
+    interval: BillingInterval;
+    amountCents: number;
+  }) => Promise<void>;
+  isPending: boolean;
+}) {
+  const [nextInterval, setNextInterval] = useState(interval);
+  const [nextAmount, setNextAmount] = useState(() =>
+    amountCents !== null && supporterTiers(interval).includes(amountCents)
+      ? amountCents
+      : featuredSupporterTier(interval),
+  );
+  const unchanged = nextInterval === interval && nextAmount === amountCents;
+
+  return (
+    <SettingsSection
+      title={m.subscription_change_title()}
+      description={m.subscription_change_description()}
+    >
+      <SettingsPanel padded className="space-y-4 divide-y-0">
+        <div
+          role="radiogroup"
+          aria-label={m.supporter_interval_label()}
+          className="grid grid-cols-2 gap-2"
+        >
+          {[BillingInterval.MONTH, BillingInterval.YEAR].map((option) => (
+            <Button
+              key={option}
+              type="button"
+              role="radio"
+              aria-checked={nextInterval === option}
+              variant={nextInterval === option ? 'secondary' : 'outline'}
+              className="h-11"
+              onClick={() => {
+                setNextAmount(sameTierIn(nextAmount, nextInterval, option));
+                setNextInterval(option);
+              }}
+            >
+              {option === BillingInterval.YEAR
+                ? m.supporter_interval_yearly()
+                : m.supporter_interval_monthly()}
+            </Button>
+          ))}
+        </div>
+        <TierPicker
+          tiers={supporterTiers(nextInterval)}
+          value={nextAmount}
+          onChange={setNextAmount}
+          label={(tier) => supporterPriceLabel(nextInterval, tier)}
+        />
+        {isFounder && !unchanged && (
+          <p className="text-sm text-muted-foreground">
+            {m.subscription_founder_price_warning()}
+          </p>
+        )}
+        <Button
+          className="h-11 w-full sm:w-auto"
+          disabled={unchanged || isPending}
+          onClick={() =>
+            onChange({ interval: nextInterval, amountCents: nextAmount })
+          }
+        >
+          {isPending ? m.loading() : m.subscription_change_cta()}
+        </Button>
+      </SettingsPanel>
+    </SettingsSection>
+  );
+}

@@ -1,0 +1,71 @@
+// ============================================================================
+// Metric Models
+// ============================================================================
+// Health and performance metrics tracked over time (weight, HRV, VO2max, etc.).
+// Metrics can be imported from external providers or manually entered.
+// ============================================================================
+
+/// Athlete metric entry.
+/// Stores a single metric value for a specific date. Metrics include health
+/// metrics (weight, HRV, sleep), performance metrics (VO2max, FTP), and daily
+/// activity metrics (steps, calories). One entry per athlete per metric type per date.
+model AthleteMetric {
+  // primary key
+  athleteMetricId Int @id @default(autoincrement()) @map("athlete_metric_id")
+
+  // fields
+  /// Metric type (WEIGHT, HRV_LAST_NIGHT_AVG, VO2MAX, DAILY_STEPS, etc.)
+  type  MetricType
+  /// Date for this metric entry
+  date  DateTime   @db.Date
+  /// Metric value (units depend on metric type)
+  value Float
+  /// Optional notes
+  notes String?
+  /// Provider the value was imported from; null when entered by hand.
+  /// Garmin requires its data to be attributed wherever it is shown
+  source ConnectorProvider?
+
+  // relationships
+  athlete   Athlete @relation(fields: [athleteId], references: [athleteId], onDelete: Cascade)
+  athleteId Int     @map("athlete_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  // indexes
+  @@unique([athleteId, type, date])
+  @@index([athleteId, type])
+  @@index([athleteId, date])
+  @@map("athlete_metric")
+}
+
+/// Bounds a coach watches on one metric of one athlete: past them, the
+/// dashboard flags it and the coach gets a notification.
+model CoachMetricThreshold {
+  // primary key
+  metricThresholdId Int @id @default(autoincrement()) @map("metric_threshold_id")
+
+  // fields
+  metricType MetricType @map("metric_type")
+  min        Float?
+  max        Float?
+  /// Values written up to then were checked for a notification: each new
+  /// or updated value is notified once
+  lastCheckedAt DateTime @default(now()) @map("last_checked_at")
+
+  // relationships
+  coach       User    @relation(fields: [coachUserId], references: [userId], onDelete: Cascade)
+  coachUserId Int     @map("coach_user_id")
+  athlete     Athlete @relation(fields: [athleteId], references: [athleteId], onDelete: Cascade)
+  athleteId   Int     @map("athlete_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([coachUserId, athleteId, metricType])
+  @@index([athleteId])
+  @@map("coach_metric_threshold")
+}

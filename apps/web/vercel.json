@@ -1,0 +1,43 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "installCommand": "cd ../.. && pnpm install --frozen-lockfile --filter @openathlete/monorepo --filter '@openathlete/web...' && pnpm database run db:generate && pnpm shared build",
+  "ignoreCommand": "bash ../../scripts/vercel-ignore-build.sh web",
+  "rewrites": [
+    {
+      "source": "/ingest/static/(.*)",
+      "destination": "https://eu-assets.i.posthog.com/static/$1"
+    },
+    {
+      "source": "/ingest/(.*)",
+      "destination": "https://eu.i.posthog.com/$1"
+    },
+    {
+      "source": "/(.*)",
+      "destination": "/index.html"
+    }
+  ],
+  "headers": [
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        {
+          "key": "Cache-Control",
+          "value": "public, max-age=31536000, immutable"
+        }
+      ]
+    },
+    {
+      "source": "/oauth/(.*)",
+      "headers": [
+        {
+          "key": "X-Frame-Options",
+          "value": "DENY"
+        },
+        {
+          "key": "Content-Security-Policy",
+          "value": "frame-ancestors 'none'"
+        }
+      ]
+    }
+  ]
+}

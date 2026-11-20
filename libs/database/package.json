@@ -1,0 +1,28 @@
+{
+  "name": "@openathlete/database",
+  "version": "1.0.0",
+  "description": "OpenAthlete database library",
+  "author": "Tristan Bouillot <tristan@tblt.fr>",
+  "license": "AGPL-3.0-only",
+  "main": "./generated/client/index.js",
+  "scripts": {
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:reset": "prisma migrate reset",
+    "db:revert": "prisma migrate resolve",
+    "db:seed:demo-month": "tsx scripts/seed-demo-month.ts",
+    "build:config": "node scripts/build-docker-config.js"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "prisma": "6.19.3",
+    "tsx": "^4.23.15",
+    "typescript": "~5.9.3"
+  },
+  "keywords": [],
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "dotenv": "^16.6.1"
+  }
+}

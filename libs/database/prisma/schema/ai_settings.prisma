@@ -1,0 +1,156 @@
+// ============================================================================
+// AI settings (bring your own key)
+// ============================================================================
+// Users connect their own AI provider keys and choose the model used by each
+// AI feature. Without a key of their own, features fall back to the instance
+// keys when their plan (or the instance policy) includes hosted AI.
+// ============================================================================
+
+/// AI feature a model can be chosen for. DEFAULT applies to every feature
+/// without a specific choice.
+enum AiTask {
+  DEFAULT
+  EVENT_GENERATION
+  EVENT_MODIFICATION
+  POST_ACTIVITY_QUESTIONS
+  FEEDBACK_EXTRACTION
+  TRAINING_LOAD_ESTIMATION
+  ACTIVITY_SUMMARY
+  /// Voice notes turned into text (Whisper, on the instance key)
+  VOICE_TRANSCRIPTION
+
+  @@map("ai_task")
+}
+
+/// A user's API key for an AI provider.
+model AiCredential {
+  // primary key
+  aiCredentialId Int @id @default(autoincrement()) @map("ai_credential_id")
+
+  // fields
+  /// Provider id from the model registry (e.g. "openai", "anthropic"), or
+  /// "custom" for an OpenAI-compatible endpoint
+  provider        String
+  /// Name shown in the settings
+  label           String
+  /// API key encrypted with AES-256-GCM, never returned to clients
+  encryptedApiKey String    @map("encrypted_api_key")
+  /// Last characters of the key, to recognise it in the settings
+  apiKeyHint      String    @map("api_key_hint")
+  /// Extra HTTP headers (JSON, encrypted with AES-256-GCM) for gateways that
+  /// require them, such as OpenCode Go
+  encryptedHeaders String?  @map("encrypted_headers")
+  /// Base URL of a custom OpenAI-compatible endpoint
+  baseUrl         String?   @map("base_url")
+  /// Last provider error (rejected key, exhausted quota...)
+  lastError       String?   @map("last_error")
+  lastErrorAt     DateTime? @map("last_error_at")
+  lastUsedAt      DateTime? @map("last_used_at")
+
+  // relationships
+  user             User                @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId           Int                 @map("user_id")
+  modelPreferences AiModelPreference[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([userId])
+  @@map("ai_credential")
+}
+
+/// The model a user picked for an AI feature, with the key it runs on.
+model AiModelPreference {
+  // primary key
+  aiModelPreferenceId Int @id @default(autoincrement()) @map("ai_model_preference_id")
+
+  // fields
+  task    AiTask
+  /// Model id at the credential's provider (e.g. "gpt-5.1")
+  modelId String @map("model_id")
+
+  // relationships
+  user           User         @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId         Int          @map("user_id")
+  credential     AiCredential @relation(fields: [aiCredentialId], references: [aiCredentialId], onDelete: Cascade)
+  aiCredentialId Int          @map("ai_credential_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, task])
+  @@index([aiCredentialId])
+  @@map("ai_model_preference")
+}
+
+/// What a user wants an AI feature to do their way (how to set warm-up
+/// targets, what to ask after a session...). Only applies when the feature
+/// runs on the user's own key: the instance keys keep the generic prompts.
+model AiCustomInstruction {
+  // primary key
+  aiCustomInstructionId Int @id @default(autoincrement()) @map("ai_custom_instruction_id")
+
+  // fields
+  /// Feature the instructions apply to, never DEFAULT nor EVENT_MODIFICATION
+  /// (workout editing follows EVENT_GENERATION's instructions)
+  task         AiTask
+  /// Added to the feature's prompt, after its generic instructions
+  instructions String
+
+  // relationships
+  user   User @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId Int  @map("user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, task])
+  @@map("ai_custom_instruction")
+}
+
+/// Whose key paid for an AI call.
+enum AiKeySource {
+  /// The user's own key: billed to them, only counted for their information
+  OWN_KEY
+  /// The instance keys: counted against the user's weekly allowance
+  HOSTED
+  /// The instance keys, for automatic tasks with their own budget, outside
+  /// the user's allowance
+  AUTOMATED
+
+  @@map("ai_key_source")
+}
+
+/// Tokens a user's AI calls used in a day, per feature and key source.
+/// Allowance windows (the week) are sums of days.
+model AiUsage {
+  // primary key
+  aiUsageId Int @id @default(autoincrement()) @map("ai_usage_id")
+
+  // fields
+  /// Calendar day in the user's time zone, the one their week resets in.
+  /// Rows from before daily counts hold a whole month on its first day.
+  day          DateTime    @db.Date
+  task         AiTask
+  source       AiKeySource
+  inputTokens  Int         @default(0) @map("input_tokens")
+  outputTokens Int         @default(0) @map("output_tokens")
+  /// Cost on the instance keys, in millionths of a US dollar
+  costMicroUsd Int         @default(0) @map("cost_micro_usd")
+  calls        Int         @default(0)
+
+  // relationships
+  /// User whose key or allowance paid for the calls
+  user   User @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId Int  @map("user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, day, task, source])
+  @@map("ai_usage")
+}

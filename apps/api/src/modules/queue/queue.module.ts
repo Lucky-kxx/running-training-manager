@@ -1,0 +1,463 @@
+import { BullModule } from '@nestjs/bullmq';
+import { Logger, Module, forwardRef } from '@nestjs/common';
+import { ConfigModule, ConfigService } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
+
+import { ApiEnvSchemaType } from '@openathlete/shared';
+
+import { ActivitySummaryListener } from 'src/listeners/activity-summary.listener';
+
+import { AiModule } from '../ai/ai.module';
+import { CalendarModule } from '../calendar/calendar.module';
+import { CoreModule } from '../core';
+import { ProvidersSyncModule } from '../providers-sync/providers-sync.module';
+import { ActivityImportProcessor } from './processors/activity-import.processor';
+import { ActivityProcessingProcessor } from './processors/activity-processing.processor';
+import { ActivitySummaryProcessor } from './processors/activity-summary.processor';
+import { CorosSyncProcessor } from './processors/coros-sync.processor';
+import { DuplicateActivitiesProcessor } from './processors/duplicate-activities.processor';
+import { GarminNotificationProcessor } from './processors/garmin-notification.processor';
+import { PolarNotificationProcessor } from './processors/polar-notification.processor';
+import { ProviderFullImportProcessor } from './processors/provider-full-import.processor';
+import { StravaDescriptionProcessor } from './processors/strava-description.processor';
+import { SuuntoNotificationProcessor } from './processors/suunto-notification.processor';
+import { TrainingLoadEstimationProcessor } from './processors/training-load-estimation.processor';
+import { TrainingLoadRecalcProcessor } from './processors/training-load-recalc.processor';
+import { QueueService } from './queue.service';
+import { GapBackfillService } from './services/gap-backfill.service';
+import { IntensityBackfillService } from './services/intensity-backfill.service';
+import { RecordsBackfillService } from './services/records-backfill.service';
+import { TrainingLoadEstimationService } from './services/training-load-estimation.service';
+
+function parseRedisUrl(redisUrl: string): {
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  db?: number;
+} {
+  let hostPortDbToParse: string;
+  let decodedPasswordToUse: string | undefined;
+  let usernameToUse: string | undefined;
+
+  const urlMatchWithUser = redisUrl.match(/^redis:\/\/([^:]+):([^@]+)@(.+)$/);
+  if (urlMatchWithUser) {
+    const [, username, password, hostPortDb] = urlMatchWithUser;
+    usernameToUse = username;
+    try {
+      decodedPasswordToUse = decodeURIComponent(password);
+    } catch {
+      decodedPasswordToUse = password;
+    }
+    hostPortDbToParse = hostPortDb;
+  } else {
+    const urlMatchNoUser = redisUrl.match(/^redis:\/\/(?::([^@]+)@)?(.+)$/);
+    if (!urlMatchNoUser) {
+      throw new Error('Invalid Redis URL format');
+    }
+    const [, password, hostPortDb] = urlMatchNoUser;
+    if (password) {
+      try {
+        decodedPasswordToUse = decodeURIComponent(password);
+      } catch {
+        decodedPasswordToUse = password;
+      }
+    }
+    hostPortDbToParse = hostPortDb;
+  }
+
+  let host: string;
+  let port: number;
+  let db: number | undefined;
+
+  const bracketedMatch = hostPortDbToParse.match(
+    /^\[([^\]]+)\](?::(\d+))?(?:\/(\d+))?$/,
+  );
+  if (bracketedMatch) {
+    host = bracketedMatch[1];
+    port = bracketedMatch[2] ? Number.parseInt(bracketedMatch[2], 10) : 6379;
+    db = bracketedMatch[3] ? Number.parseInt(bracketedMatch[3], 10) : undefined;
+    return {
+      host,
+      port,
+      db,
+      username: usernameToUse,
+      password: decodedPasswordToUse,
+    };
+  }
+
+  const lastColonIndex = hostPortDbToParse.lastIndexOf(':');
+  const slashIndex = hostPortDbToParse.indexOf('/', lastColonIndex);
+
+  if (lastColonIndex === -1) {
+    return {
+      host: hostPortDbToParse,
+      port: 6379,
+      username: usernameToUse,
+      password: decodedPasswordToUse,
+    };
+  }
+
+  const portStr =
+    slashIndex !== -1
+      ? hostPortDbToParse.substring(lastColonIndex + 1, slashIndex)
+      : hostPortDbToParse.substring(lastColonIndex + 1);
+
+  port = Number.parseInt(portStr, 10);
+  if (Number.isNaN(port)) {
+    return {
+      host: hostPortDbToParse,
+      port: 6379,
+      username: usernameToUse,
+      password: decodedPasswordToUse,
+    };
+  }
+
+  host = hostPortDbToParse.substring(0, lastColonIndex);
+  if (slashIndex !== -1) {
+    const dbStr = hostPortDbToParse.substring(slashIndex + 1);
+    const dbNum = Number.parseInt(dbStr, 10);
+    if (!Number.isNaN(dbNum)) {
+      db = dbNum;
+    }
+  }
+
+  return {
+    host,
+    port,
+    db,
+    username: usernameToUse,
+    password: decodedPasswordToUse,
+  };
+}
+
+@Module({
+  imports: [
+    ...(process.env.GARMIN_PERSONAL_API_ENABLED === 'true'
+      ? [BullModule.registerQueue({ name: 'garmin-personal-sync' })]
+      : []),
+    AiModule,
+    ConfigModule,
+    EventEmitterModule,
+    forwardRef(() => CoreModule),
+    forwardRef(() => ProvidersSyncModule),
+    forwardRef(() => CalendarModule),
+    BullModule.forRootAsync({
+      imports: [ConfigModule],
+      inject: [ConfigService],
+      useFactory: (configService: ConfigService<ApiEnvSchemaType, true>) => {
+        const redisUrl = configService.get('REDIS_URL');
+        const logger = new Logger('QueueModule');
+        const isWorker =
+          configService.get('ENABLE_ACTIVITY_IMPORT') === true ||
+          configService.get('ENABLE_ACTIVITY_PROCESSING') === true;
+
+        const redisOptions = {
+          retryStrategy: (times: number) => {
+            const maxRetries = 3;
+            if (times > maxRetries) {
+              logger.error(
+                `Redis connection failed after ${times} attempts, giving up`,
+              );
+              return null;
+            }
+            const baseDelay = isWorker ? 500 : 200;
+            const delay = Math.min(times * baseDelay, isWorker ? 5000 : 2000);
+            logger.warn(
+              `Redis connection attempt ${times} failed, retrying in ${delay}ms`,
+            );
+            return delay;
+          },
+          lazyConnect: false,
+          connectTimeout: isWorker ? 30000 : 10000,
+          commandTimeout: isWorker ? 60000 : 15000,
+          enableReadyCheck: true,
+          maxRetriesPerRequest: null,
+          maxListeners: 20,
+        };
+
+        if (!redisUrl) {
+          logger.warn(
+            'REDIS_URL not set, using default Redis connection (localhost:6379)',
+          );
+          return {
+            connection: {
+              host: 'localhost',
+              port: 6379,
+              ...redisOptions,
+            },
+          };
+        }
+
+        try {
+          const parsed = parseRedisUrl(redisUrl);
+          const config: {
+            host: string;
+            port: number;
+            username?: string;
+            password?: string;
+            db?: number;
+            retryStrategy: (times: number) => number | null;
+            lazyConnect: boolean;
+            connectTimeout: number;
+            commandTimeout: number;
+            maxRetriesPerRequest: null;
+          } = {
+            host: parsed.host,
+            port: parsed.port,
+            ...redisOptions,
+          };
+
+          if (parsed.username) {
+            config.username = parsed.username;
+          }
+
+          if (parsed.password) {
+            config.password = parsed.password;
+          }
+
+          if (parsed.db !== undefined) {
+            config.db = parsed.db;
+          }
+
+          return {
+            connection: config,
+          };
+        } catch {
+          logger.warn(
+            `Could not parse REDIS_URL, using as-is. Some connection options may not apply.`,
+          );
+          return {
+            connection: {
+              host: 'localhost',
+              port: 6379,
+              ...redisOptions,
+            },
+          };
+        }
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'activity-import',
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 1000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'activity-processing',
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 1000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'activity-summary',
+      defaultJobOptions: {
+        removeOnComplete: true,
+        removeOnFail: { age: 86400, count: 1000 },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'duplicate-activities',
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 10_000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'provider-full-import',
+      defaultJobOptions: {
+        // Provider APIs rate limit history listing: retry slowly
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 60_000,
+        },
+        removeOnComplete: {
+          age: 7 * 24 * 3600,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'garmin-notification',
+      defaultJobOptions: {
+        // An activity file can arrive before its activity is saved, and a
+        // history import can take hours to reach it: 12 attempts space the
+        // retries over about 17 hours, within the file's 24-hour validity
+        attempts: 12,
+        backoff: {
+          type: 'exponential',
+          delay: 30_000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 5000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'coros-sync',
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: {
+          type: 'exponential',
+          delay: 60_000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 5000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'polar-notification',
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: {
+          type: 'exponential',
+          delay: 30_000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 5000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'suunto-notification',
+      defaultJobOptions: {
+        attempts: 5,
+        backoff: {
+          type: 'exponential',
+          delay: 30_000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 5000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'strava-description',
+      defaultJobOptions: {
+        // Strava's quotas reset every 15 minutes: retry over about an hour
+        attempts: 4,
+        backoff: {
+          type: 'exponential',
+          delay: 5 * 60_000,
+        },
+        removeOnComplete: {
+          age: 7 * 24 * 3600,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'training-load-estimation',
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: {
+          type: 'exponential',
+          delay: 2000,
+        },
+        removeOnComplete: {
+          age: 24 * 3600,
+          count: 1000,
+        },
+        removeOnFail: {
+          age: 7 * 24 * 3600,
+        },
+      },
+    }),
+    BullModule.registerQueue({
+      name: 'training-load-recalc',
+      defaultJobOptions: {
+        attempts: 3,
+        backoff: { type: 'exponential', delay: 5000 },
+        removeOnComplete: { age: 24 * 3600, count: 1000 },
+        removeOnFail: { age: 7 * 24 * 3600 },
+      },
+    }),
+  ],
+  providers: [
+    QueueService,
+    TrainingLoadEstimationService,
+    // Note: We use process.env here because ConfigService is not available
+    // at module definition time. The value is validated by envValidationSchema.
+    ...(process.env.ENABLE_ACTIVITY_IMPORT === 'true'
+      ? [
+          ActivityImportProcessor,
+          ProviderFullImportProcessor,
+          GarminNotificationProcessor,
+          SuuntoNotificationProcessor,
+          PolarNotificationProcessor,
+          CorosSyncProcessor,
+          StravaDescriptionProcessor,
+        ]
+      : []),
+    ...(process.env.ENABLE_ACTIVITY_PROCESSING === 'true'
+      ? [
+          ActivityProcessingProcessor,
+          ActivitySummaryListener,
+          ActivitySummaryProcessor,
+          DuplicateActivitiesProcessor,
+          TrainingLoadRecalcProcessor,
+          RecordsBackfillService,
+          GapBackfillService,
+          IntensityBackfillService,
+        ]
+      : []),
+    ...(process.env.ENABLE_TRAINING_LOAD_ESTIMATION === 'true'
+      ? [TrainingLoadEstimationProcessor]
+      : []),
+  ],
+  exports: [QueueService, TrainingLoadEstimationService, BullModule],
+})
+export class QueueModule {}

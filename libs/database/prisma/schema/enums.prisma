@@ -1,0 +1,552 @@
+enum UserRole {
+  ATHLETE
+  COACH
+
+  @@map("user_role")
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+
+  @@map("gender")
+}
+
+/// What the athlete came for, asked during onboarding
+enum TrainingGoal {
+  RACE
+  PROGRESS
+  RESTART
+  FOLLOW_COACH
+
+  @@map("training_goal")
+}
+
+/// Time the athlete can train each week, asked during onboarding
+enum WeeklyTrainingHours {
+  UNDER_3
+  FROM_3_TO_6
+  FROM_6_TO_10
+  OVER_10
+
+  @@map("weekly_training_hours")
+}
+
+/// How many athletes a coach follows, asked during onboarding
+enum CoachTeamSize {
+  STARTING
+  FROM_1_TO_5
+  FROM_6_TO_20
+  OVER_20
+
+  @@map("coach_team_size")
+}
+
+/// How a user heard of OpenAthlete, asked during onboarding
+enum AcquisitionSource {
+  REDDIT
+  GOOGLE
+  AI_ASSISTANT
+  COACH_OR_FRIEND
+  DISCORD
+  YOUTUBE
+  OTHER
+
+  @@map("acquisition_source")
+}
+
+enum EventType {
+  TRAINING
+  COMPETITION
+  NOTE
+  ACTIVITY
+
+  @@map("event_type")
+}
+
+enum ConnectorProvider {
+  STRAVA
+  GARMIN
+  FITBIT
+  APPLE_HEALTH
+  SUUNTO
+  COROS
+  POLAR
+
+  @@map("connector_provider")
+}
+
+enum SportType {
+  RUNNING
+  TRAIL_RUNNING
+  CYCLING
+  SWIMMING
+  ROCK_CLIMBING
+  HIKING
+  STRENGTH
+  CROSSFIT
+  YOGA
+  ALPINE_SKI
+  BACKCOUNTRY_SKI
+  BADMINTON
+  CANOEING
+  E_BIKE_RIDE
+  ELLIPTICAL
+  E_MOUNTAIN_BIKE_RIDE
+  GOLF
+  GRAVEL_RIDE
+  HANDCYCLE
+  HIGH_INTENSITY_INTERVAL_TRAINING
+  ICE_SKATE
+  INLINE_SKATE
+  KAYAKING
+  KITESURF
+  MARTIAL_ARTS
+  MOBILITY
+  MOUNTAIN_BIKE_RIDE
+  NORDIC_SKI
+  PICKLEBALL
+  PILATES
+  RACQUETBALL
+  ROLLER_SKI
+  ROWING
+  SAIL
+  SKATEBOARD
+  SNOWBOARD
+  SNOWSHOE
+  SOCCER
+  SQUASH
+  STAIR_STEPPER
+  STAND_UP_PADDLING
+  SURFING
+  TABLE_TENNIS
+  TENNIS
+  VELOMOBILE
+  VIRTUAL_RIDE
+  VIRTUAL_ROW
+  VIRTUAL_RUN
+  WALK
+  WEIGHT_TRAINING
+  WHEELCHAIR
+  WINDSURF
+  WORKOUT
+  TRIATHLON
+  DUATHLON
+  AQUATHLON
+  AQUABIKE
+  OTHER
+
+  @@map("sport_type")
+}
+
+enum TrainingZoneType {
+  HEARTRATE
+  POWER
+  PACE
+
+  @@map("training_zone_type")
+}
+
+enum TokenType {
+  PASSWORD_RESET
+  ATHLETE_INVITATION
+  COACH_INVITATION
+  /// One-time code that hands an OpenID Connect sign-in to the web app
+  OIDC_LOGIN
+
+  @@map("token_type")
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+
+  @@map("invitation_status")
+}
+
+enum RecordType {
+  SPEED
+  HEARTRATE
+  POWER
+  ELEVATION_GAIN
+  ELEVATION_LOSS
+  CADENCE
+
+  @@map("record_type")
+}
+
+enum AgentMessageRole {
+  USER
+  ASSISTANT
+  SYSTEM
+  TOOL
+
+  @@map("agent_message_role")
+}
+
+enum AgentMessageStatus {
+  pending
+  processing
+  completed
+  error
+
+  @@map("agent_message_status")
+}
+
+enum AgentBlockType {
+  TEXT
+  THINKING
+  TOOL_CALL
+  TOOL_RESULT
+  CODE
+  CHART_LINE
+  CHART_BAR
+  CHART_PIE
+  CHART_SCATTER
+  CHART_AREA
+  TABLE
+  MAP
+  ACTIVITY_SUMMARY
+  ACTIVITY_LIST
+  ACTIVITY_CREATED
+  TRAINING_PLAN
+  ERROR
+  IMAGE
+  FILE
+
+  @@map("agent_block_type")
+}
+
+enum AgentBlockStatus {
+  pending
+  processing
+  completed
+  error
+  cancelled
+
+  @@map("agent_block_status")
+}
+
+enum EquipmentType {
+  SHOE
+  BIKE
+
+  @@map("equipment_type")
+}
+
+enum NormalizationFactor {
+  SLOPE
+  TEMPERATURE
+  ALTITUDE
+  WIND
+  HUMIDITY
+  RADIATION
+
+  @@map("normalization_factor")
+}
+
+enum MetricType {
+  // Santé & composition corporelle
+  WEIGHT
+  HEIGHT
+  BMI
+  BODY_FAT
+  MUSCLE_MASS
+  BONE_MASS
+  BODY_WATER
+  DAILY_CALORIES
+  DAILY_ACTIVE_CALORIES
+  DAILY_BMR_CALORIES
+  DAILY_STEPS
+  DAILY_DISTANCE
+  DAILY_ACTIVE_MINUTES
+  DAILY_MODERATE_MINUTES
+  DAILY_VIGOROUS_MINUTES
+  DAILY_FLOORS
+  SLEEP_DURATION
+  SLEEP_SCORE
+  SLEEP_REM_DURATION
+  SLEEP_DEEP_DURATION
+  SLEEP_LIGHT_DURATION
+  SLEEP_AWAKE_DURATION
+  SLEEP_RESPIRATION_AVG
+  SLEEP_SPO2_AVG
+  NAP_DURATION
+  HOOPER_INDEX
+
+  // Cardiaque
+  HR_MAX
+  HR_REST
+  HR_MIN_DAILY
+  HR_AVG_DAILY
+  HR_MAX_DAILY
+  HR_RESERVE
+  RMSSD
+  HRV_LAST_NIGHT_AVG
+  HRV_LAST_NIGHT_5MIN_HIGH
+  SNAPSHOT_HEART_RATE_AVG
+  SNAPSHOT_STRESS_AVG
+  SNAPSHOT_RESPIRATION_AVG
+  SNAPSHOT_SPO2_AVG
+  SNAPSHOT_SDNN
+  SNAPSHOT_RMSSD
+  RESPIRATION_RATE_AVG
+  PULSE_OX_AVG
+  PULSE_OX_MIN
+  BLOOD_PRESSURE_SYSTOLIC
+  BLOOD_PRESSURE_DIASTOLIC
+  BLOOD_PRESSURE_PULSE
+  STRESS_AVERAGE
+  STRESS_MAX
+  STRESS_DURATION
+  STRESS_REST_DURATION
+  STRESS_ACTIVITY_DURATION
+  STRESS_LOW_DURATION
+  STRESS_MEDIUM_DURATION
+  STRESS_HIGH_DURATION
+  BODY_BATTERY_CHARGED
+  BODY_BATTERY_DRAINED
+  SKIN_TEMP_DEVIATION
+
+  // Performance & physiologie
+  VMA
+  CRITICAL_POWER_RUNNING
+  CRITICAL_POWER_CYCLING
+  VO2MAX
+  VO2MAX_CYCLING
+  FTP_RUNNING
+  FTP_CYCLING
+  VERTICAL_SPEED_AVG
+  VERTICAL_SPEED_MAX
+  FITNESS_INDEX
+  FITNESS_AGE
+
+  @@map("metric_type")
+}
+
+enum TrainingLoadCalculationType {
+  FOSTER_RPE // Foster method using RPE x duration
+  TRIMP // TRIMP using exponential HR weighting
+
+  @@map("training_load_calculation_type")
+}
+
+enum WorkoutStepType {
+  WARMUP
+  COOLDOWN
+  INTERVAL_ACTIVE // work interval
+  INTERVAL_REST // recovery interval
+  STEADY // steady pace/effort
+  REPEAT // container for repeated steps
+  FREE // open/unstructured
+
+  @@map("workout_step_type")
+}
+
+enum WorkoutDurationType {
+  TIME // duration in seconds
+  DISTANCE // distance in meters
+  CALORIES // calories to burn
+  HR_BELOW // until HR drops below value
+  HR_ABOVE // until HR rises above value
+  LAP_BUTTON // manual lap press
+  OPEN // no defined duration
+  REPS // number of repetitions (for strength training)
+
+  @@map("workout_duration_type")
+}
+
+enum WorkoutTargetType {
+  OPEN // no specific target
+  PACE // pace/speed target (stored as m/s, can display in min/km)
+  HEARTRATE // heart rate target
+  POWER // power target
+  CADENCE // cadence target
+  RPE // rate of perceived exertion
+  WEIGHT // weight/load target (for strength training)
+  ZONE // training zone (1-5 typically for HR/power zones)
+
+  @@map("workout_target_type")
+}
+
+enum ProviderAccountStatus {
+  active
+  revoked
+
+  @@map("provider_account_status")
+}
+
+enum ProviderWorkoutExportStatus {
+  pending
+  success
+  failed
+  skipped
+
+  @@map("provider_workout_export_status")
+}
+
+enum PlanStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+
+  @@map("plan_status")
+}
+
+enum CyclePhase {
+  BASE
+  SPECIFIC
+  TAPER
+  RECOVERY
+  COMPETITION
+
+  @@map("cycle_phase")
+}
+
+enum AvailabilityPriority {
+  LOW
+  MEDIUM
+  HIGH
+
+  @@map("availability_priority")
+}
+
+enum UserLanguage {
+  FR
+  EN
+  IT
+  ES
+  PT_BR
+  DE
+
+  @@map("user_language")
+}
+
+enum ActivitySegmentType {
+  LAP // automatic or manual lap from device
+  WORKOUT_STEP // segment from a planned workout
+  MANUAL // manually created segment
+  AUTO_SPLIT // automatically detected split (e.g., by distance)
+
+  @@map("activity_segment_type")
+}
+
+enum InjuryStatus {
+  WORSENING
+  IMPROVING
+  STABLE
+  RESOLVED
+
+  @@map("injury_status")
+}
+
+enum SubscriptionPlan {
+  FREE
+  SUPPORTER
+
+  @@map("subscription_plan")
+}
+
+enum BillingInterval {
+  month
+  year
+
+  @@map("billing_interval")
+}
+
+enum BillingProvider {
+  stripe
+  apple
+
+  @@map("billing_provider")
+}
+
+enum SubscriptionStatus {
+  active
+  canceled
+  past_due
+  trialing
+  incomplete
+  incomplete_expired
+  unpaid
+
+  @@map("subscription_status")
+}
+
+/// How much a race matters in the season: A is the goal, C a training race
+enum CompetitionPriority {
+  A
+  B
+  C
+
+  @@map("competition_priority")
+}
+
+/// What a cycle stands for: a block of training, or a period the athlete
+/// cannot train (travel, illness, injury)
+enum CycleKind {
+  TRAINING
+  TRAVEL
+  ILLNESS
+  INJURY
+
+  @@map("cycle_kind")
+}
+
+enum ActivityProfileKind {
+  GRADE
+  SPEED
+  POWER
+  DRIFT_PACE
+  DRIFT_HEARTRATE
+  DRIFT_POWER
+
+  @@map("activity_profile_kind")
+}
+
+/// The emails sent on their own, after what a user did or did not do
+enum LifecycleEmailKind {
+  /// No watch connected a day after signing up
+  CONNECT_REMINDER
+  /// Still nothing after four days: what got in the way?
+  CONNECT_QUESTION
+  /// The history arrived
+  IMPORT_DONE
+  /// Activities, but nothing planned and no race a week later
+  PLAN_NUDGE
+  /// The sync stopped without the user disconnecting it
+  CONNECTION_LOST
+  /// The past month in figures
+  MONTHLY_RECAP
+  /// Once, to those who asked for news: becoming a Supporter
+  SUPPORTER_ASK
+  /// A Supporter cancelled: why?
+  SUPPORTER_CANCELLED
+  /// Once, to founders of the Supporter tiers: nothing changes for them
+  FOUNDER_ANNOUNCEMENT
+
+  @@map("lifecycle_email_kind")
+}
+
+enum ExerciseSide {
+  EACH // both sides, one after the other
+  LEFT
+  RIGHT
+  ALTERNATE
+
+  @@map("exercise_side")
+}
+
+enum WorkoutRepeatKind {
+  REPEAT // plain repetitions, or the sets of one exercise
+  SUPERSET
+  CIRCUIT
+  EMOM
+  AMRAP
+  TABATA
+
+  @@map("workout_repeat_kind")
+}

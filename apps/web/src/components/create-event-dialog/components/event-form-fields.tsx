@@ -1,0 +1,223 @@
+import { useGetMyEquipmentQuery } from '@/api/equipment';
+import { SportIcon } from '@/components/sport-icon/sport-icon';
+import { m } from '@/paraglide/messages';
+import { sportTypeLabelMap } from '@/utils/label-map/core';
+import { UseFormSetValue } from 'react-hook-form';
+
+import { EVENT_TYPE, SPORT_TYPE, formatSpeed } from '@openathlete/shared';
+
+import { formatCompactDuration } from '../../calendar/utils/week-summary';
+import {
+  RHFDistance,
+  RHFDuration,
+  RHFSelect,
+  RHFTextField,
+} from '../../hook-form';
+import { RHFCheckbox } from '../../hook-form/rhf-checkbox';
+import { RHFDateTimePicker } from '../../hook-form/rhf-datetime-picker';
+import { RHFElevation } from '../../hook-form/rhf-elevation';
+import { RHFRpe } from '../../hook-form/rhf-rpe';
+import { RHFTextarea } from '../../hook-form/rhf-textarea';
+import { SelectItem } from '../../ui/select';
+import {
+  type EventFormValues,
+  NO_EQUIPMENT,
+} from '../utils/event-form-schemas';
+import { CompetitionPriorityField } from './competition-priority-field';
+
+type Props = {
+  type: EVENT_TYPE;
+  /** The workout's estimated total in seconds, null without timed steps */
+  workoutDuration?: number | null;
+  /** The planned duration no longer follows the workout */
+  durationSetByHand?: boolean;
+  onDurationEdited?: () => void;
+  onFollowWorkout?: () => void;
+  startDateValue?: Date;
+  endDateValue?: Date;
+  /** Equipment can only be chosen among the user's own */
+  canChooseEquipment?: boolean;
+  goalDistanceValue?: number | null;
+  goalDurationValue?: number | null;
+  setValue: UseFormSetValue<EventFormValues>;
+  isTemplate?: boolean;
+  /** A new activity logged by hand: its duration, distance and elevation */
+  logging?: boolean;
+};
+
+export function EventFormFields({
+  type,
+  workoutDuration,
+  durationSetByHand,
+  onDurationEdited,
+  onFollowWorkout,
+  startDateValue,
+  endDateValue,
+  canChooseEquipment,
+  goalDistanceValue,
+  goalDurationValue,
+  setValue,
+  isTemplate,
+  logging,
+}: Props) {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 gap-4 md:gap-6">
+      <RHFTextField
+        name="name"
+        type="text"
+        placeholder={m.morning_run()}
+        label={m.event_name()}
+        required
+      />
+      {type === EVENT_TYPE.TRAINING ||
+      type === EVENT_TYPE.COMPETITION ||
+      type === EVENT_TYPE.ACTIVITY ? (
+        <RHFSelect
+          name="sport"
+          label={m.sport()}
+          required
+          placeholder={m.select_a_sport()}
+        >
+          {Object.values(SPORT_TYPE).map((sport) => (
+            <SelectItem key={sport} value={sport}>
+              <SportIcon sport={sport} /> {sportTypeLabelMap[sport]}
+            </SelectItem>
+          ))}
+        </RHFSelect>
+      ) : (
+        <div className="hidden md:block" />
+      )}
+      {!isTemplate &&
+        (type === EVENT_TYPE.TRAINING || type === EVENT_TYPE.COMPETITION) && (
+          <div className="col-span-1 md:col-span-2">
+            {/* The end follows in the dialog, from the planned duration */}
+            <RHFDateTimePicker name="startDate" label={m.start_date()} />
+          </div>
+        )}
+      {!isTemplate && type === EVENT_TYPE.ACTIVITY && (
+        <div className="col-span-1 md:col-span-2">
+          <RHFDateTimePicker
+            name="startDate"
+            label={m.start_date()}
+            onChange={(date) => {
+              // The recorded duration stays: only the time moves
+              if (date && startDateValue && endDateValue) {
+                const duration =
+                  new Date(endDateValue).getTime() -
+                  new Date(startDateValue).getTime();
+                setValue('endDate', new Date(date.getTime() + duration));
+              }
+            }}
+          />
+        </div>
+      )}
+      <div className="col-span-1 md:col-span-2">
+        <RHFTextarea
+          name="description"
+          label={m.description()}
+          className="h-24"
+          required={type === EVENT_TYPE.NOTE}
+        />
+      </div>
+      {(type === EVENT_TYPE.TRAINING || type === EVENT_TYPE.COMPETITION) && (
+        <>
+          <RHFDistance name="goalDistance" label={m.goal_distance()} />
+          <div className="space-y-1">
+            {/* Editable even with a workout: the coach's figure wins */}
+            <RHFDuration
+              name="goalDuration"
+              label={m.goal_duration()}
+              onChange={() => onDurationEdited?.()}
+            />
+            {typeof workoutDuration === 'number' &&
+              (durationSetByHand ? (
+                <button
+                  type="button"
+                  className="text-left text-xs md:text-sm text-primary underline-offset-4 hover:underline max-md:min-h-11"
+                  onClick={onFollowWorkout}
+                >
+                  {m.goal_duration_use_workout_total({
+                    duration: formatCompactDuration(workoutDuration),
+                  })}
+                </button>
+              ) : (
+                <p className="text-xs md:text-sm text-muted-foreground">
+                  {m.goal_duration_follows_workout()}
+                </p>
+              ))}
+          </div>
+          {!!goalDistanceValue && !!goalDurationValue && (
+            <div className="text-xs md:text-sm text-muted-foreground flex flex-col md:flex-row md:items-center gap-1 md:gap-0 col-span-1 md:col-span-2">
+              <span>
+                {m.pace()}:{' '}
+                {formatSpeed(
+                  Number(goalDistanceValue) / Number(goalDurationValue),
+                  'min/km',
+                )}{' '}
+                {m.per_km()}
+              </span>
+              <span className="hidden md:inline"> - </span>
+              <span>
+                {formatSpeed(
+                  Number(goalDistanceValue) / Number(goalDurationValue),
+                  'km/h',
+                )}{' '}
+                {m.kilometers_per_hour()}
+              </span>
+            </div>
+          )}
+          <RHFElevation
+            name="goalElevationGain"
+            label={m.goal_elevation_gain()}
+          />
+          <RHFRpe name="goalRpe" label={m.goal_rpe()} />
+          {type === EVENT_TYPE.COMPETITION && <CompetitionPriorityField />}
+        </>
+      )}
+      {type === EVENT_TYPE.ACTIVITY && logging && (
+        <>
+          <RHFDuration
+            name="duration"
+            label={m.duration()}
+            onChange={(seconds) => {
+              // The end follows: the API reads the duration from it
+              if (startDateValue && seconds) {
+                setValue(
+                  'endDate',
+                  new Date(new Date(startDateValue).getTime() + seconds * 1000),
+                );
+              }
+            }}
+          />
+          <RHFDistance name="distance" label={m.distance()} />
+          <RHFElevation name="elevationGain" label={m.elevation_gain()} />
+        </>
+      )}
+      {type === EVENT_TYPE.ACTIVITY && (
+        <>
+          {canChooseEquipment && <ActivityEquipmentSelect />}
+          <div className="flex items-end pb-2">
+            <RHFCheckbox name="isRace" label={m.activity_is_race()} />
+          </div>
+          <div className="col-span-1 md:col-span-2">
+            <RHFRpe name="rpe" label={m.rpe()} />
+          </div>
+        </>
+      )}
+    </div>
+  );
+}
+
+function ActivityEquipmentSelect() {
+  const { data: equipment = [] } = useGetMyEquipmentQuery();
+  return (
+    <RHFSelect name="equipment" label={m.equipment()}>
+      <SelectItem value={NO_EQUIPMENT}>{m.no_equipment()}</SelectItem>
+      {equipment.map((item) => (
+        <SelectItem key={item.equipmentId} value={String(item.equipmentId)}>
+          {item.name}
+        </SelectItem>
+      ))}
+    </RHFSelect>
+  );
+}

@@ -1,0 +1,106 @@
+// ============================================================================
+// Training Plan Models
+// ============================================================================
+// Training plan architecture for periodized training:
+// - TrainingPlan: High-level plan with goal and date range
+// - Cycle: Training cycles within a plan (e.g., Base, Build, Taper)
+// - TrainingWeek: Weekly structure within cycles
+// - AthleteAvailability: Athlete's weekly schedule for plan generation
+// ============================================================================
+
+/// Training plan.
+/// High-level training plan with a goal (e.g., "Finish UTMB 2025", "Sub-3:30 marathon").
+/// Contains multiple cycles and can be in DRAFT, ACTIVE, COMPLETED, or ARCHIVED status.
+model TrainingPlan {
+  // primary key
+  trainingPlanId Int @id @default(autoincrement()) @map("training_plan_id")
+
+  // fields
+  /// Plan name
+  name        String
+  /// Plan description
+  description String?
+  /// Training goal (e.g., "Finish UTMB 2025", "Sub-3:30 marathon")
+  goal        String
+  /// Plan start date
+  startDate   DateTime   @map("start_date")
+  /// Plan end date
+  endDate     DateTime   @map("end_date")
+  /// Plan status: DRAFT, ACTIVE, COMPLETED, or ARCHIVED
+  status      PlanStatus @default(DRAFT)
+
+  // relationships
+  athlete   Athlete @relation(fields: [athleteId], references: [athleteId], onDelete: Cascade)
+  athleteId Int     @map("athlete_id")
+  cycles    Cycle[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([athleteId, status])
+  @@map("training_plan")
+}
+
+/// Training week.
+/// Represents a week within a training cycle. Contains training sessions
+/// (Events) and can have a theme, target volume, and target training load.
+model TrainingWeek {
+  // primary key
+  trainingWeekId Int @id @default(autoincrement()) @map("training_week_id")
+
+  // fields
+  /// Position in the cycle (1, 2, 3, ...)
+  weekNumber   Int      @map("week_number")
+  /// Week start date
+  startDate    DateTime @map("start_date")
+  /// Week end date
+  endDate      DateTime @map("end_date")
+  /// Week theme (e.g., "VO2 intervals", "Base building", "Taper week")
+  theme        String?
+  /// Target training volume in seconds
+  targetVolume Int?     @map("target_volume")
+  /// Target training load (TRIMP)
+  targetLoad   Float?   @map("target_load")
+
+  // relationships
+  cycle    Cycle   @relation(fields: [cycleId], references: [cycleId], onDelete: Cascade)
+  cycleId  Int     @map("cycle_id")
+  sessions Event[] // training sessions scheduled in this week
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([cycleId, weekNumber])
+  @@map("training_week")
+}
+
+/// Athlete availability schedule.
+/// Defines when an athlete is available for training during the week.
+/// Used by training plan generation to schedule sessions at appropriate times.
+model AthleteAvailability {
+  // primary key
+  athleteAvailabilityId Int @id @default(autoincrement()) @map("athlete_availability_id")
+
+  // fields
+  /// Day of week: 0=Sunday, 1=Monday, ..., 6=Saturday
+  dayOfWeek Int                  @map("day_of_week")
+  /// Start time in "HH:mm" format (24h), e.g., "08:00"
+  startTime String               @map("start_time")
+  /// End time in "HH:mm" format (24h), e.g., "12:00"
+  endTime   String               @map("end_time")
+  /// Availability priority: LOW, MEDIUM, or HIGH
+  priority  AvailabilityPriority @default(MEDIUM)
+
+  // relationships
+  athlete   Athlete @relation(fields: [athleteId], references: [athleteId], onDelete: Cascade)
+  athleteId Int     @map("athlete_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([athleteId, dayOfWeek])
+  @@map("athlete_availability")
+}

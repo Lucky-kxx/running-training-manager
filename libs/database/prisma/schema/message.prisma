@@ -1,0 +1,171 @@
+// ============================================================================
+// Messaging System Models
+// ============================================================================
+// Messaging system for athlete-coach communication
+// Separate from agent_thread/agent_message which are for AI chatbot
+//
+// Architecture:
+// - message_thread: Conversation threads between users (athlete-coach)
+// - message: Individual messages in a thread
+// - message_read_receipt: Track who has read which messages
+//
+// Threads can be linked to training sessions (event_training) for comments
+// ============================================================================
+
+model MessageThread {
+
+  // primary key
+  messageThreadId Int @id @default(autoincrement()) @map("message_thread_id")
+
+  // fields
+  title String?
+
+  // Thread type: can be a general conversation or linked to an activity
+  // If linked to event_activity, this is a comment thread for that activity
+  eventActivityId Int? @unique @map("event_activity_id")
+
+  // relationships
+  // Participants: users who are part of this thread
+  // For athlete-coach threads: one athlete + one or more coaches
+  participants MessageThreadParticipant[]
+  messages     Message[]
+  files        StoredFile[]
+
+  // Link to activity if this is a comment thread
+  eventActivity EventActivity? @relation("ActivityCommentThread", fields: [eventActivityId], references: [eventActivityId], onDelete: Cascade)
+
+  // Link to training session if this is a comment thread (legacy, prefer eventActivity)
+  eventTraining EventTraining? @relation("TrainingCommentThread")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([eventActivityId])
+  @@map("message_thread")
+}
+
+model MessageThreadParticipant {
+
+  // primary key
+  messageThreadParticipantId Int @id @default(autoincrement()) @map("message_thread_participant_id")
+
+  // fields
+  // Last time this user read messages in this thread
+  lastReadAt         DateTime? @map("last_read_at")
+  lastNotificationAt DateTime? @map("last_notification_at")
+
+  // relationships
+  thread          MessageThread @relation(fields: [messageThreadId], references: [messageThreadId], onDelete: Cascade)
+  messageThreadId Int           @map("message_thread_id")
+  user            User          @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId          Int           @map("user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([messageThreadId, userId])
+  @@index([userId])
+  @@index([messageThreadId])
+  @@map("message_thread_participant")
+}
+
+model Message {
+
+  // primary key
+  messageId Int @id @default(autoincrement()) @map("message_id")
+
+  // fields
+  content  String
+  editedAt DateTime? @map("edited_at") // When the message was edited (null if never edited)
+
+  // relationships
+  thread          MessageThread        @relation(fields: [messageThreadId], references: [messageThreadId], onDelete: Cascade)
+  messageThreadId Int                  @map("message_thread_id")
+  sender          User                 @relation(fields: [senderId], references: [userId], onDelete: Cascade)
+  senderId        Int                  @map("sender_id")
+  activityNotice ActivityChatNotice?
+  readReceipts    MessageReadReceipt[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([messageThreadId, createdAt])
+  @@index([senderId])
+  @@map("message")
+}
+
+model MessageReadReceipt {
+
+  // primary key
+  messageReadReceiptId Int @id @default(autoincrement()) @map("message_read_receipt_id")
+
+  // fields
+
+  // relationships
+  message   Message @relation(fields: [messageId], references: [messageId], onDelete: Cascade)
+  messageId Int     @map("message_id")
+  user      User    @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId    Int     @map("user_id")
+
+  // timestamps
+  readAt DateTime @default(now()) @map("read_at")
+
+  @@unique([messageId, userId])
+  @@index([userId])
+  @@index([messageId])
+  @@map("message_read_receipt")
+}
+
+/// How a message to several people goes out: one private conversation per
+/// recipient (their answers stay private), or one conversation for all of
+/// them (they see each other's names).
+enum BroadcastMode {
+  INDIVIDUAL
+  GROUP
+
+  @@map("broadcast_mode")
+}
+
+enum ScheduledMessageStatus {
+  PENDING
+  /// Claimed by one instance of the API, which is sending it
+  SENDING
+  SENT
+  CANCELED
+  FAILED
+
+  @@map("scheduled_message_status")
+}
+
+/// A message a coach wrote to send later, to one or several people.
+model ScheduledMessage {
+  // primary key
+  scheduledMessageId Int @id @default(autoincrement()) @map("scheduled_message_id")
+
+  // fields
+  content          String
+  mode             BroadcastMode
+  /// Title of the group conversation (GROUP only)
+  title            String?
+  /// Users it goes to. Checked again when it is sent: someone the coach no
+  /// longer coaches by then does not get it.
+  recipientUserIds Int[]                  @map("recipient_user_ids")
+  sendAt           DateTime               @map("send_at")
+  status           ScheduledMessageStatus @default(PENDING)
+  sentAt           DateTime?              @map("sent_at")
+
+  // relationships
+  sender   User @relation(fields: [senderId], references: [userId], onDelete: Cascade)
+  senderId Int  @map("sender_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([status, sendAt])
+  @@index([senderId])
+  @@map("scheduled_message")
+}

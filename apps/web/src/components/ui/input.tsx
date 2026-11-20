@@ -1,0 +1,75 @@
+import { cn } from '@/utils/shadcn';
+import * as React from 'react';
+
+function Input({
+  className,
+  type,
+  onChange,
+  onKeyDown,
+  ...props
+}: React.ComponentProps<'input'>) {
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (
+      (type === 'number' || type === 'tel') &&
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+      e.shiftKey
+    ) {
+      e.preventDefault();
+      const step = e.key === 'ArrowUp' ? 10 : -10;
+      const currentValue = parseFloat(e.currentTarget.value) || 0;
+      const min = e.currentTarget.min
+        ? parseFloat(e.currentTarget.min)
+        : -Infinity;
+      const max = e.currentTarget.max
+        ? parseFloat(e.currentTarget.max)
+        : Infinity;
+      const newValue = Math.min(max, Math.max(min, currentValue + step));
+      e.currentTarget.value = newValue.toString();
+      // Call onChange directly to ensure React Hook Form detects the change
+      if (onChange) {
+        const syntheticEvent = {
+          ...e,
+          target: e.currentTarget,
+          currentTarget: e.currentTarget,
+        } as React.ChangeEvent<HTMLInputElement>;
+        onChange(syntheticEvent);
+      }
+      e.currentTarget.dispatchEvent(new Event('input', { bubbles: true }));
+      e.currentTarget.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+    onKeyDown?.(e);
+  };
+
+  return (
+    <input
+      type={type}
+      data-slot="input"
+      className={cn(
+        'border-input file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground flex h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm',
+        'focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]',
+        'aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive',
+        className,
+      )}
+      onChange={onChange}
+      onKeyDown={handleKeyDown}
+      {...props}
+    />
+  );
+}
+
+function Textarea({ className, ...props }: React.ComponentProps<'textarea'>) {
+  return (
+    <textarea
+      data-slot="input"
+      className={cn(
+        'border-input file:text-foreground placeholder:text-muted-foreground selection:bg-primary selection:text-primary-foreground flex h-9 w-full min-w-0 rounded-md border bg-transparent px-3 py-1 text-base shadow-xs transition-[color,box-shadow] outline-none file:inline-flex file:h-7 file:border-0 file:bg-transparent file:text-sm file:font-medium disabled:pointer-events-none disabled:cursor-not-allowed disabled:opacity-50 md:text-sm',
+        'focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px]',
+        'aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 aria-invalid:border-destructive',
+        className,
+      )}
+      {...props}
+    />
+  );
+}
+
+export { Input, Textarea };

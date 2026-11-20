@@ -1,0 +1,1647 @@
+import { Response } from 'express';
+import { ZodValidationPipe } from 'nestjs-zod';
+
+import {
+  BadRequestException,
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  NotFoundException,
+  Param,
+  ParseArrayPipe,
+  ParseIntPipe,
+  Patch,
+  Post,
+  Query,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiOperation,
+  ApiParam,
+  ApiProduces,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+
+import { Event } from '@openathlete/database';
+import {
+  ActivityCorrection,
+  ActivityStream,
+  CreateEventDto,
+  DuplicateEventDto,
+  DuplicateWorkoutDto,
+  EVENT_TYPE,
+  EventBatchParamsDto,
+  EventSearchQuery,
+  PlanForAthletesDto,
+  PlanForAthletesPreviewDto,
+  PlanForAthletesResultDto,
+  ReorderWorkoutStepsDto,
+  RepeatEventDto,
+  SeasonEvent,
+  ShiftEventsDto,
+  UndoEventBatchResultDto,
+  UpdateEventDto,
+  activityCorrectionSchema,
+  createEventDtoSchema,
+  duplicateEventDtoSchema,
+  duplicateWorkoutSchema,
+  eventBatchParamsSchema,
+  eventSearchQuerySchema,
+  planForAthletesDtoSchema,
+  reorderWorkoutStepsSchema,
+  repeatEventDtoSchema,
+  shiftEventsDtoSchema,
+  updateEventDtoSchema,
+} from '@openathlete/shared';
+
+import { RATE_LIMITS } from 'src/common/security/rate-limits';
+import { JwtUser, UserTypeGuard } from 'src/modules/auth';
+import { AuthUser } from 'src/modules/auth/decorators/user.decorator';
+
+import { EventService } from '../services';
+import { ActivityCorrectionsService } from '../services/activity-corrections.service';
+import { ActivityFeedbackService } from '../services/activity-feedback.service';
+import { CalendarFeedService } from '../services/calendar-feed.service';
+import { EventBatchService } from '../services/event-batch.service';
+import { EventBulkService } from '../services/event-bulk.service';
+import { EventSeriesService } from '../services/event-series.service';
+import { ManualActivityService } from '../services/manual-activity.service';
+
+@ApiTags('Event')
+@Controller('event')
+export class EventController {
+  constructor(
+    private eventService: EventService,
+    private activityFeedbackService: ActivityFeedbackService,
+    private calendarFeedService: CalendarFeedService,
+    private eventBulkService: EventBulkService,
+    private readonly eventBatchService: EventBatchService,
+    private eventSeriesService: EventSeriesService,
+    private manualActivityService: ManualActivityService,
+    private activityCorrectionsService: ActivityCorrectionsService,
+  ) {}
+
+  @Get('ical')
+  @Throttle(RATE_LIMITS.calendarFeed)
+  @ApiOperation({
+    summary: 'Get iCal calendar file',
+    description:
+      "Retrieves an iCal calendar file (.ics) of an athlete's planned sessions, races and notes, from 90 days ago to a year ahead (activities excluded). The feed token, from GET /event/ical/secret, finds the athlete. Public, for calendar apps: no bearer token.",
+  })
+  @ApiQuery({
+    name: 'calendar',
+    type: String,
+    description:
+      'Feed token of the athlete. Use GET /event/ical/secret to obtain it.',
+    example: 'q3H1v0nJ8kE2b9cW7xYz4aB5dF6gH7iJ8kL9mN0oP1r',
+    required: true,
+  })
+  @ApiProduces('text/calendar')
+  @ApiResponse({
+    status: 200,
+    description: 'iCal calendar file generated successfully',
+    content: {
+      'text/calendar': {
+        schema: {
+          type: 'string',
+          format: 'binary',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - unknown or revoked feed token',
+  })
+  async getIcalCalendar(
+    @Res() res: Response,
+    @Query('calendar') token: string | undefined,
+  ) {
+    const feed = await this.calendarFeedService.renderFeed(token);
+    res.setHeader('Content-Type', 'text/calendar; charset=utf-8');
+    res.setHeader('Content-Disposition', 'attachment; filename="calendar.ics"');
+    // Calendar apps poll every few hours; a short private cache absorbs bursts
+    res.setHeader('Cache-Control', 'private, max-age=900');
+    res.send(feed);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('ical/secret')
+  @ApiOperation({
+    summary: 'Get iCal calendar feed token',
+    description:
+      "Returns the feed token of the user's calendar, creating it on the first request. The same token comes back until it is regenerated. Use it at GET /event/ical?calendar={token}.",
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Feed token of the calendar',
+    schema: { type: 'string' },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - athlete not found for user',
+  })
+  async getMyIcalCalendarSecret(@JwtUser() user: AuthUser) {
+    return this.calendarFeedService.getOrCreateToken(user);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('ical/secret')
+  @ApiOperation({
+    summary: 'Regenerate the iCal calendar feed token',
+    description:
+      "Replaces the feed token of the user's calendar and returns the new one. The previous feed URL stops working at once.",
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'New feed token of the calendar',
+    schema: { type: 'string' },
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - athlete not found for user',
+  })
+  async regenerateMyIcalCalendarSecret(@JwtUser() user: AuthUser) {
+    return this.calendarFeedService.regenerateToken(user);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('unvalidated/:athleteId')
+  @ApiOperation({
+    summary: 'Get unvalidated activity sessions for an athlete',
+    description:
+      "Retrieves activity events that are not validated according to the athlete's settings. An activity is considered unvalidated if: (1) require_rpe is enabled and RPE is missing, (2) require_comment is enabled and description/comment is missing or empty. The results can be filtered by date range. Only activity events are returned (not training, competition, or note events). Uses CASL authorization to verify that the user has read access to the athlete.",
+  })
+  @ApiParam({
+    name: 'athleteId',
+    type: Number,
+    description: 'ID of the athlete to get unvalidated sessions for',
+    example: 1,
+  })
+  @ApiQuery({
+    name: 'startDate',
+    type: String,
+    description:
+      'Optional start date filter (ISO date string). Events that start, end, or span across this date will be included.',
+    example: '2024-01-01T00:00:00.000Z',
+    required: false,
+  })
+  @ApiQuery({
+    name: 'endDate',
+    type: String,
+    description:
+      'Optional end date filter (ISO date string). Events that start, end, or span across this date will be included.',
+    example: '2024-01-31T23:59:59.999Z',
+    required: false,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of unvalidated activity events retrieved successfully',
+    schema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        description: 'Activity event object with all related information',
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this athlete',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - athlete not found',
+  })
+  getUnvalidatedSessions(
+    @JwtUser() user: AuthUser,
+    @Param('athleteId', ParseIntPipe) athleteId: number,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.eventService.getUnvalidatedSessions(
+      user,
+      athleteId,
+      startDate ? new Date(startDate) : undefined,
+      endDate ? new Date(endDate) : undefined,
+    );
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get()
+  @ApiOperation({
+    summary: 'Get events for the authenticated user',
+    description:
+      'Retrieves events (training, competition, note, activity) accessible to the authenticated user. If coach=true, returns events for all athletes the user coaches. If athleteId is provided, filters events for that specific athlete. Results can be filtered by date range - events that start, end, or span across the date range are included. Each event includes all related information (workout, segments, feedback questions, etc.). Uses CASL authorization to determine which events the user can access.',
+  })
+  @ApiQuery({
+    name: 'coach',
+    type: String,
+    description:
+      'If "true", returns events for all athletes the user coaches. Otherwise, returns events for the user\'s own athlete.',
+    example: 'true',
+    required: false,
+  })
+  @ApiQuery({
+    name: 'athleteId',
+    type: String,
+    description:
+      'Optional athlete ID to filter events. If coach=true, filters to this specific athlete. If coach=false, this parameter is ignored.',
+    example: '1',
+    required: false,
+  })
+  @ApiQuery({
+    name: 'startDate',
+    type: String,
+    description:
+      'Optional start date filter (ISO date string). Events that start, end, or span across this date will be included.',
+    example: '2024-01-01T00:00:00.000Z',
+    required: false,
+  })
+  @ApiQuery({
+    name: 'endDate',
+    type: String,
+    description:
+      'Optional end date filter (ISO date string). Events that start, end, or span across this date will be included.',
+    example: '2024-01-31T23:59:59.999Z',
+    required: false,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of events retrieved successfully',
+    schema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        description:
+          'Event object (training, competition, note, or activity) with all related information',
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  getMyEvents(
+    @JwtUser() user: AuthUser,
+    @Query('coach') coach: string,
+    @Query('athleteId') athleteId: string,
+    @Query('startDate') startDate?: string,
+    @Query('endDate') endDate?: string,
+  ) {
+    return this.eventService.getMyEvents(
+      user,
+      coach === 'true',
+      athleteId ? Number(athleteId) : undefined,
+      startDate ? new Date(startDate) : undefined,
+      endDate ? new Date(endDate) : undefined,
+    );
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('season')
+  @ApiOperation({
+    summary: 'Sessions, races and activities of a season, in short',
+    description:
+      'What the season view sums up week by week, for up to two years: goals of planned sessions and races, and what activities recorded.',
+  })
+  getSeasonEvents(
+    @JwtUser() user: AuthUser,
+    @Query('startDate') startDate: string,
+    @Query('endDate') endDate: string,
+    @Query('athleteId', new ParseIntPipe({ optional: true }))
+    athleteId?: number,
+  ): Promise<SeasonEvent[]> {
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    if (
+      Number.isNaN(start.getTime()) ||
+      Number.isNaN(end.getTime()) ||
+      end < start ||
+      end.getTime() - start.getTime() > 731 * 24 * 3600 * 1000
+    ) {
+      throw new BadRequestException(
+        'startDate and endDate, in order and at most two years apart',
+      );
+    }
+    return this.eventService.getSeasonEvents(user, start, end, athleteId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('upcoming-competitions')
+  @ApiOperation({
+    summary: 'Get upcoming competition events',
+    description:
+      'Retrieves all future competition events accessible to the authenticated user. If coach=true, returns competitions for all athletes the user coaches. If athleteId is provided, filters competitions for that specific athlete. Results are sorted by start date in ascending order. Uses CASL authorization to determine which events the user can access.',
+  })
+  @ApiQuery({
+    name: 'coach',
+    type: String,
+    description:
+      'If "true", returns competitions for all athletes the user coaches. Otherwise, returns competitions for the user\'s own athlete.',
+    example: 'true',
+    required: false,
+  })
+  @ApiQuery({
+    name: 'athleteId',
+    type: String,
+    description:
+      'Optional athlete ID to filter competitions. If coach=true, filters to this specific athlete. If coach=false, this parameter is ignored.',
+    example: '1',
+    required: false,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'List of upcoming competition events retrieved successfully',
+    schema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        description: 'Competition event object with all related information',
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  getUpcomingCompetitions(
+    @JwtUser() user: AuthUser,
+    @Query('coach') coach: string,
+    @Query('athleteId') athleteId: string,
+  ) {
+    return this.eventService.getUpcomingCompetitions(
+      user,
+      coach === 'true',
+      athleteId ? Number(athleteId) : undefined,
+    );
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('search')
+  @ApiOperation({
+    summary: 'Search activities by name',
+    description:
+      'Finds up to 20 activities whose name contains the text, newest first, among those the user can read: their own and those of the athletes they coach.',
+  })
+  @ApiQuery({ name: 'q', type: String, example: 'trail', required: true })
+  @ApiResponse({ status: 200, description: 'Matching activities' })
+  @ApiResponse({ status: 400, description: 'Text shorter than 2 characters' })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  searchActivities(
+    @JwtUser() user: AuthUser,
+    @Query(new ZodValidationPipe(eventSearchQuerySchema))
+    query: EventSearchQuery,
+  ) {
+    return this.eventService.searchActivities(user, query.q);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId')
+  @ApiOperation({
+    summary: 'Get a specific event by ID',
+    description:
+      'Retrieves a single event (training, competition, note, or activity) by its ID. The event includes all related information: for training events - workout with steps, targets, repeat blocks; for activity events - segments, feedback questions, weather, normalization; for competition events - related activity if linked. Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the event to retrieve',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Event retrieved successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Event object (training, competition, note, or activity) with all related information',
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event not found',
+  })
+  getEvent(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventService.getEventById(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post()
+  @ApiOperation({
+    summary: 'Create a new event',
+    description:
+      "Creates a new event (training, competition, note, or activity). For training events, a workout can be included with steps, targets, and repeat blocks. The event is assigned to an athlete (defaults to the authenticated user's athlete if not specified). For training events with workouts within 7 days, a workout export sync event is emitted. For future training events, training load estimation is automatically scheduled. If the event is a training with a workout, the workout is created with all steps, targets, and nested repeat blocks. Uses CASL authorization to verify that the user can create events for the specified athlete.",
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      description:
+        'Event creation data. Structure varies by event type (training, competition, note, activity). For training events, workout with steps can be included.',
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Event created successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Complete event object (training, competition, note, or activity) with all related information',
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - validation error or athlete ID required',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user is not allowed to create events for this athlete',
+  })
+  createEvent(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(createEventDtoSchema)) body: CreateEventDto,
+  ) {
+    // Logged by hand: built apart, with the processing imports get
+    if (body.type === EVENT_TYPE.ACTIVITY) {
+      return this.manualActivityService.create(user, body);
+    }
+    return this.eventService.createEvent(user, body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch(':eventId')
+  @ApiOperation({
+    summary: 'Update an existing event',
+    description:
+      'Updates an existing event. All fields are optional - only provided fields will be updated. For training events, the workout can be updated (existing steps are deleted and replaced). If RPE is updated on an activity, training load recalculation is triggered. If description is updated on an activity, message threads are created/updated. For training events with workouts within 7 days, workout export sync events are emitted. For future training events without estimated_load, training load estimation is scheduled. Templates are excluded from workout export sync and training load estimation. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the event to update',
+    example: 1,
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      description:
+        'Event update data. Structure varies by event type. All fields are optional.',
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Event updated successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Complete updated event object (training, competition, note, or activity) with all related information',
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - validation error',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have update access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event not found',
+  })
+  updateEvent(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(updateEventDtoSchema)) body: UpdateEventDto,
+  ) {
+    return this.eventService.updateEvent(user, eventId, body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId/stream')
+  @ApiOperation({
+    summary: 'Get activity stream data',
+    description:
+      'Retrieves activity stream data (GPS, heart rate, power, cadence, etc.) for an activity event. The stream is compressed in the database and is decompressed and optionally reduced to a specific resolution. If keys are provided, only those stream types are returned. Otherwise, all available stream types are returned. The resolution parameter determines how many data points to return (e.g., resolution=100 returns 100 evenly spaced points). Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiQuery({
+    name: 'resolution',
+    type: Number,
+    description:
+      'Number of data points to return. The stream will be reduced to this resolution (evenly spaced points).',
+    example: 100,
+    required: true,
+  })
+  @ApiQuery({
+    name: 'keys',
+    type: [String],
+    description:
+      'Optional array of stream keys to return. If not provided, all available stream types are returned. Valid keys: latitude, longitude, altitude, heartRate, power, cadence, speed, etc.',
+    example: ['latitude', 'longitude', 'heartRate'],
+    required: false,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Activity stream retrieved successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Activity stream object with arrays of data points for each requested stream type',
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event or activity stream not found',
+  })
+  getEventStream(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Query('resolution', ParseIntPipe) resolution: number,
+    @Query('keys', ParseArrayPipe) keys?: (keyof ActivityStream)[],
+  ) {
+    return this.eventService.getEventStream(user, eventId, resolution, keys);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId/gpx')
+  @Throttle(RATE_LIMITS.activityFile)
+  @ApiOperation({
+    summary: 'Download the GPS track of an activity as GPX',
+    description:
+      'The GPS track as a GPX 1.1 file, to follow the route again or open it in another app. Each point has its altitude and time, and heart rate and cadence in the Garmin TrackPointExtension; a GPS gap starts a new segment. Any activity with GPS has one, whatever it was imported from; the activity stream has `latlng` when it does. An activity imported from Garmin names it as its source (`<src>Garmin [device]</src>`), as the Garmin brand guidelines require. Limited to 30 files a minute. Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiProduces('application/gpx+xml')
+  @ApiResponse({
+    status: 200,
+    description: 'The GPX file, as an attachment',
+    content: {
+      'application/gpx+xml': { schema: { type: 'string', format: 'binary' } },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 404,
+    description:
+      'Not found - event not found or not readable by the user, or no GPS track',
+  })
+  @ApiResponse({ status: 429, description: 'Too many files requested' })
+  async getEventGpx(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Res() res: Response,
+  ) {
+    const file = await this.eventService.getEventGpx(user, eventId);
+    res.setHeader('Content-Type', 'application/gpx+xml; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="${file.fileName}"`,
+    );
+    // Private data: never from a shared cache
+    res.setHeader('Cache-Control', 'private, no-store');
+    res.send(file.content);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId/weather')
+  @ApiOperation({
+    summary: 'Get weather data for an activity',
+    description:
+      'Retrieves weather data associated with an activity event. Weather data includes resolution (in meters), provider name, and samples (array of weather measurements along the activity route). Weather data is typically fetched from external weather services when an activity is imported. Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Weather data retrieved successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        resolutionM: {
+          type: 'number',
+          description: 'Weather data resolution in meters',
+          example: 1000,
+        },
+        provider: {
+          type: 'string',
+          description: 'Weather data provider name',
+          example: 'openweathermap',
+        },
+        samples: {
+          type: 'array',
+          description: 'Array of weather measurements along the activity route',
+          items: {
+            type: 'object',
+          },
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description:
+      'Not found - event or activity not found. An activity without weather data answers null.',
+  })
+  getEventWeather(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventService.getEventWeather(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId/normalization')
+  @ApiOperation({
+    summary: 'Get speed normalization data for an activity',
+    description:
+      'Retrieves speed normalization data for an activity event. Normalization adjusts speed based on elevation changes and other factors. Returns the average normalized speed and an array of normalization factors with their time ranges and percentages. Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Normalization data retrieved successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        averageNormalizedSpeed: {
+          type: 'number',
+          nullable: true,
+          description: 'Average normalized speed for the activity',
+          example: 12.5,
+        },
+        factors: {
+          type: 'array',
+          description: 'Array of normalization factors with time ranges',
+          items: {
+            type: 'object',
+            properties: {
+              factor: {
+                type: 'number',
+                description: 'Normalization factor value',
+                example: 1.05,
+              },
+              timeSeconds: {
+                type: 'number',
+                description: 'Time in seconds for this factor',
+                example: 300,
+              },
+              percent: {
+                type: 'number',
+                description: 'Percentage of total time this factor applies',
+                example: 25.5,
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event or activity not found',
+  })
+  getEventNormalization(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventService.getEventNormalization(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get(':eventId/activity/feedback-questions')
+  @ApiOperation({
+    summary: 'Get activity feedback questions',
+    description:
+      'Retrieves feedback questions for an activity event. Questions are ordered by ID and include question text, QCM options (if applicable), and answer text (if answered). Also returns whether feedback has been skipped. This endpoint delegates to the ActivityFeedbackService. Uses CASL authorization to verify that the user has read access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Feedback questions retrieved successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        questions: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              questionId: { type: 'number', example: 1 },
+              questionText: { type: 'string', example: 'How did you feel?' },
+              qcmOptions: {
+                type: 'array',
+                nullable: true,
+                items: {
+                  type: 'object',
+                  properties: { label: { type: 'string' } },
+                },
+              },
+              answerText: { type: 'string', nullable: true, example: 'Good' },
+            },
+          },
+        },
+        feedbackSkipped: {
+          type: 'boolean',
+          description: 'Whether feedback has been skipped for this activity',
+          example: false,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have read access to this activity',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event is not an activity or activity not found',
+  })
+  async getActivityFeedbackQuestions(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    // Get eventActivityId from event
+    const eventData = await this.eventService.getEventById(user, eventId);
+    if (eventData.type !== 'ACTIVITY') {
+      throw new NotFoundException('Activity not found for this event');
+    }
+    const eventActivityId = (eventData as { eventActivityId?: number })
+      .eventActivityId;
+    if (!eventActivityId) {
+      throw new NotFoundException('Activity ID not found');
+    }
+    return this.activityFeedbackService.getActivityFeedbackQuestions(
+      user,
+      eventActivityId,
+    );
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch(':eventId/activity/feedback-questions/:questionId/answer')
+  @ApiOperation({
+    summary: 'Submit an answer to a feedback question',
+    description:
+      'Submits an answer to a specific feedback question for an activity event. Only the athlete who owns the activity can submit answers. If all questions are answered after this submission, an ActivityFeedbackCompletedEvent is emitted. This endpoint delegates to the ActivityFeedbackService. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiParam({
+    name: 'questionId',
+    type: Number,
+    description: 'ID of the feedback question',
+    example: 1,
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        answerText: {
+          type: 'string',
+          description: 'Answer text for the question',
+          example: 'I felt good during the run',
+        },
+      },
+      required: ['answerText'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Answer submitted successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        questionId: { type: 'number', example: 1 },
+        answerText: { type: 'string', example: 'I felt good during the run' },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - validation error',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have update access or is not the activity owner',
+  })
+  @ApiResponse({
+    status: 404,
+    description:
+      'Not found - event is not an activity, activity not found, or question not found',
+  })
+  async submitQuestionAnswer(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Param('questionId', ParseIntPipe) questionId: number,
+    @Body('answerText') answerText: string,
+  ) {
+    // Get eventActivityId from event
+    const eventData = await this.eventService.getEventById(user, eventId);
+    if (eventData.type !== 'ACTIVITY') {
+      throw new NotFoundException('Activity not found for this event');
+    }
+    const eventActivityId = (eventData as { eventActivityId?: number })
+      .eventActivityId;
+    if (!eventActivityId) {
+      throw new NotFoundException('Activity ID not found');
+    }
+    return this.activityFeedbackService.submitQuestionAnswer(
+      user,
+      eventActivityId,
+      questionId,
+      answerText,
+    );
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/activity/feedback/skip')
+  @ApiOperation({
+    summary: 'Skip feedback for an activity',
+    description:
+      'Marks feedback as skipped for an activity event. Only the athlete who owns the activity can skip feedback. This endpoint delegates to the ActivityFeedbackService. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Feedback skipped successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean', example: true },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have update access or is not the activity owner',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event is not an activity or activity not found',
+  })
+  async skipFeedback(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    const eventData = await this.eventService.getEventById(user, eventId);
+    if (eventData.type !== 'ACTIVITY') {
+      throw new NotFoundException('Activity not found for this event');
+    }
+    const eventActivityId = (eventData as { eventActivityId?: number })
+      .eventActivityId;
+    if (!eventActivityId) {
+      throw new NotFoundException('Activity ID not found');
+    }
+    return this.activityFeedbackService.skipFeedback(user, eventActivityId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/activity/feedback/unskip')
+  @ApiOperation({
+    summary: 'Unskip feedback for an activity',
+    description:
+      'Reopens feedback for an activity event that was previously skipped. Only the athlete who owns the activity can unskip feedback. This endpoint delegates to the ActivityFeedbackService. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the activity event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Feedback unskipped successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: { type: 'boolean', example: true },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have update access or is not the activity owner',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event is not an activity or activity not found',
+  })
+  async unskipFeedback(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    const eventData = await this.eventService.getEventById(user, eventId);
+    if (eventData.type !== 'ACTIVITY') {
+      throw new NotFoundException('Activity not found for this event');
+    }
+    const eventActivityId = (eventData as { eventActivityId?: number })
+      .eventActivityId;
+    if (!eventActivityId) {
+      throw new NotFoundException('Activity ID not found');
+    }
+    return this.activityFeedbackService.unskipFeedback(user, eventActivityId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete(':eventId')
+  @ApiOperation({
+    summary: 'Delete an event',
+    description:
+      'Deletes an event and all its related data. For training events, the workout and all provider exports are deleted. For activity events, weather data, normalization factors, records, feedback questions, and embeddings are deleted. The event and all its sub-entities (training, competition, note, activity) are permanently removed. If the event has an athlete, a WebSocket notification is sent for weekly load update. This operation cannot be undone. Uses CASL authorization to verify that the user has delete access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the event to delete',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Event deleted successfully',
+    schema: {
+      type: 'object',
+      description: 'Deleted event object',
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have delete access to this event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event not found',
+  })
+  deleteEvent(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventService.deleteEvent(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/repeat')
+  @ApiOperation({
+    summary: 'Repeat a planned event',
+    description:
+      'Copies a planned session, race or note every 1 to 4 weeks, on the same weekday and local time, until a date (at most 90 days on). The original and its copies form a series. One transaction.',
+  })
+  @ApiResponse({ status: 201, description: 'The new occurrences, by date' })
+  @ApiResponse({
+    status: 400,
+    description: 'Nothing to repeat before this date',
+  })
+  @ApiResponse({ status: 404, description: 'Event not found or not editable' })
+  repeatEvent(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(repeatEventDtoSchema)) dto: RepeatEventDto,
+  ) {
+    return this.eventSeriesService.repeat(user, eventId, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch(':eventId/series')
+  @ApiOperation({
+    summary: 'Edit an occurrence and the following ones',
+    description:
+      'Applies the same changes to this occurrence of a series and the following ones still to do. A new date moves them all by the same number of days, to the same new time. Without a series, edits this event only.',
+  })
+  @ApiResponse({ status: 200, description: 'The updated occurrences' })
+  @ApiResponse({ status: 404, description: 'Event not found or not editable' })
+  updateEventSeries(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(updateEventDtoSchema)) dto: UpdateEventDto,
+  ) {
+    return this.eventSeriesService.updateFollowing(user, eventId, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete(':eventId/series')
+  @ApiOperation({
+    summary: 'Delete an occurrence and the following ones',
+    description:
+      'Deletes this occurrence of a series and the following ones still to do (done sessions stay). Without a series, deletes this event only.',
+  })
+  @ApiResponse({ status: 200, description: 'How many events were deleted' })
+  @ApiResponse({ status: 404, description: 'Event not found or not deletable' })
+  deleteEventSeries(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventSeriesService.deleteFollowing(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('plan-for-athletes/preview')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Preview sessions planned for several athletes',
+    description:
+      'What planning a template, or sessions of one calendar, for these athletes would meet, athlete by athlete: thresholds missing for percentage targets, zones missing, sessions already planned on those days, illness, injury or travel periods. Writes nothing. Fails with 403 if the user cannot plan for one of the athletes.',
+  })
+  @ApiResponse({ status: 200, description: 'The preview' })
+  @ApiResponse({ status: 403, description: 'Not allowed for some athletes' })
+  @ApiResponse({ status: 404, description: 'Template or events not found' })
+  previewPlanForAthletes(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(planForAthletesDtoSchema))
+    dto: PlanForAthletesDto,
+  ): Promise<PlanForAthletesPreviewDto> {
+    return this.eventBatchService.preview(user, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('plan-for-athletes')
+  @ApiOperation({
+    summary: 'Plan sessions for several athletes at once',
+    description:
+      "Copies a template, or sessions of one calendar, to each athlete: the first session lands on `date`, the others keep their distance in days, at `time` or their own time, in each athlete's time zone. Each copy is an ordinary session of its athlete, with their own zones; percentage targets follow their thresholds. All or nothing. The copies share a batch id, to undo them together.",
+  })
+  @ApiResponse({ status: 201, description: 'The batch id and the new events' })
+  @ApiResponse({ status: 403, description: 'Not allowed for some athletes' })
+  @ApiResponse({ status: 404, description: 'Template or events not found' })
+  planForAthletes(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(planForAthletesDtoSchema))
+    dto: PlanForAthletesDto,
+  ): Promise<PlanForAthletesResultDto> {
+    return this.eventBatchService.plan(user, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete('batch/:batchId')
+  @ApiOperation({
+    summary: 'Undo sessions planned for several athletes',
+    description:
+      'Deletes the sessions of a batch the user may delete. Sessions already done (an activity is linked) stay.',
+  })
+  @ApiResponse({ status: 200, description: 'How many were deleted and kept' })
+  @ApiResponse({ status: 404, description: 'No such batch for this user' })
+  undoEventBatch(
+    @JwtUser() user: AuthUser,
+    @Param(new ZodValidationPipe(eventBatchParamsSchema))
+    params: EventBatchParamsDto,
+  ): Promise<UndoEventBatchResultDto> {
+    return this.eventBatchService.undo(user, params.batchId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('bulk/copy')
+  @ApiOperation({
+    summary: 'Copy planned events by whole days',
+    description:
+      "Copies planned sessions, races and notes (with their workouts) a number of calendar days later or earlier, at the same local time in the athlete's time zone. All or nothing, in one transaction: fails with 404 if any event is missing, an activity, or not editable by the user. At most 200 events.",
+  })
+  @ApiResponse({ status: 201, description: 'The copies, by start date' })
+  @ApiResponse({ status: 400, description: 'Invalid event ids or offset' })
+  @ApiResponse({ status: 404, description: 'Some events cannot be changed' })
+  copyEvents(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(shiftEventsDtoSchema)) dto: ShiftEventsDto,
+  ) {
+    return this.eventBulkService.duplicate(user, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('bulk/move')
+  @ApiOperation({
+    summary: 'Move planned events by whole days',
+    description:
+      "Moves planned sessions, races and notes a number of calendar days later or earlier, at the same local time in the athlete's time zone. All or nothing, in one transaction: fails with 404 if any event is missing, an activity, or not editable by the user. At most 200 events.",
+  })
+  @ApiResponse({ status: 201, description: 'The moved events, by start date' })
+  @ApiResponse({ status: 400, description: 'Invalid event ids or offset' })
+  @ApiResponse({ status: 404, description: 'Some events cannot be changed' })
+  moveEvents(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(shiftEventsDtoSchema)) dto: ShiftEventsDto,
+  ) {
+    return this.eventBulkService.move(user, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/duplicate')
+  @ApiOperation({
+    summary: 'Duplicate an event',
+    description:
+      'Creates a complete duplicate of an event with all its data. For training events, the workout is duplicated with all steps, targets, and nested repeat blocks. Optionally, new start and end dates can be provided. IDs and relations are removed from the duplicated event. For future training events, training load estimation is automatically scheduled. A WebSocket notification is sent for weekly load update. Uses CASL authorization to verify that the user has read access to the source event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the event to duplicate',
+    example: 1,
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        startDate: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Optional new start date for the duplicated event',
+          example: '2024-02-01T10:00:00.000Z',
+        },
+        endDate: {
+          type: 'string',
+          format: 'date-time',
+          description: 'Optional new end date for the duplicated event',
+          example: '2024-02-01T11:30:00.000Z',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Event duplicated successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Complete duplicated event object (training, competition, note, or activity) with all related information',
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have read access to the source event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - source event not found',
+  })
+  duplicateEventComplete(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(duplicateEventDtoSchema))
+    dto: DuplicateEventDto,
+  ) {
+    return this.eventService.duplicateEventComplete(user, eventId, dto);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/related-activity/:activityId')
+  @ApiOperation({
+    summary: 'Link an activity to a training or competition event',
+    description:
+      'Links an activity event to a training or competition event. This creates a relationship where the activity represents the actual performance for the planned training/competition. The eventId must refer to a training or competition event, and activityId must refer to an activity event. Uses CASL authorization to verify that the user has update access to the event and read access to the activity.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the training or competition event',
+    example: 1,
+  })
+  @ApiParam({
+    name: 'activityId',
+    type: Number,
+    description: 'ID of the activity event to link',
+    example: 2,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Activity linked successfully',
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Bad request - eventId is not a training/competition or activityId is not an activity',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have update access to the event or read access to the activity',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event or activity not found',
+  })
+  setRelatedActivity(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Param('activityId', ParseIntPipe) activityId: Event['eventId'],
+  ) {
+    return this.eventService.setRelatedActivity(user, eventId, activityId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete(':eventId/related-activity')
+  @ApiOperation({
+    summary: 'Unlink activity from a training or competition event',
+    description:
+      'Removes the link between an activity event and a training or competition event. The eventId must refer to a training or competition event. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the training or competition event',
+    example: 1,
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Activity unlinked successfully',
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - eventId is not a training or competition event',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have update access to the event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - event not found',
+  })
+  unsetRelatedActivity(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.eventService.unsetRelatedActivity(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/activity/corrections')
+  @ApiOperation({
+    summary: "Correct an activity's recording",
+    description:
+      "Applies a correction over the activity's recording: spikes of heart rate or power, a crop to a part (seconds from the start as previous corrections left it), or smoothed altitude. The recording as it came is kept from the first correction, so corrections can be undone. Totals are recomputed and the activity is processed again (records, pace, load) without the AI. Returns the activity.",
+  })
+  @ApiParam({ name: 'eventId', type: Number, example: 1 })
+  @ApiResponse({ status: 201, description: 'Correction applied' })
+  @ApiResponse({ status: 400, description: 'Bad request - invalid correction' })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - no activity with a recording the user can edit',
+  })
+  addActivityCorrection(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(activityCorrectionSchema))
+    correction: ActivityCorrection,
+  ) {
+    return this.activityCorrectionsService.add(user, eventId, correction);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete(':eventId/activity/corrections')
+  @ApiOperation({
+    summary: 'Restore the recording as it came',
+    description:
+      'Undoes every correction of the activity: its original recording, totals, dates and laps come back. Returns the activity.',
+  })
+  @ApiParam({ name: 'eventId', type: Number, example: 1 })
+  @ApiResponse({ status: 200, description: 'Original recording restored' })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - no activity with a recording the user can edit',
+  })
+  removeActivityCorrections(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+  ) {
+    return this.activityCorrectionsService.remove(user, eventId);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete(':eventId/activity/corrections/:index')
+  @ApiOperation({
+    summary: 'Undo one correction',
+    description:
+      "Removes one correction, by its position in the activity's list, and applies the others again over the original recording. Returns the activity.",
+  })
+  @ApiParam({ name: 'eventId', type: Number, example: 1 })
+  @ApiParam({ name: 'index', type: Number, example: 0 })
+  @ApiResponse({ status: 200, description: 'Correction undone' })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - no such activity or correction',
+  })
+  removeActivityCorrection(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Param('index', ParseIntPipe) index: number,
+  ) {
+    return this.activityCorrectionsService.remove(user, eventId, index);
+  }
+
+  // ============================================================================
+  // Workout-related routes
+  // ============================================================================
+
+  /**
+   * Reorder workout steps for a training event
+   * PATCH /api/event/:eventId/workout/reorder
+   */
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch(':eventId/workout/reorder')
+  @ApiOperation({
+    summary: 'Reorder workout steps',
+    description:
+      'Reorders the steps of a workout for a training event. The stepOrders array specifies the new order for each step by providing stepId and order pairs. All steps must be included in the reorder request. Uses CASL authorization to verify that the user has update access to the event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the training event with workout',
+    example: 1,
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        stepOrders: {
+          type: 'array',
+          description: 'Array of step order assignments',
+          items: {
+            type: 'object',
+            properties: {
+              stepId: {
+                type: 'number',
+                description: 'ID of the workout step',
+                example: 1,
+              },
+              order: {
+                type: 'number',
+                description: 'New order index for this step',
+                example: 0,
+              },
+            },
+            required: ['stepId', 'order'],
+          },
+        },
+      },
+      required: ['stepOrders'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Workout steps reordered successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Complete training event object with reordered workout steps',
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - validation error',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description: 'Forbidden - user does not have update access to the event',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - training event with workout not found',
+  })
+  reorderWorkoutSteps(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(reorderWorkoutStepsSchema))
+    dto: ReorderWorkoutStepsDto,
+  ) {
+    return this.eventService.reorderWorkoutSteps(user, eventId, dto);
+  }
+
+  /**
+   * Duplicate workout from one training to another
+   * POST /api/event/:eventId/workout/duplicate
+   */
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post(':eventId/workout/duplicate')
+  @ApiOperation({
+    summary: 'Duplicate workout from one training to another',
+    description:
+      'Duplicates a workout (with all steps, targets, and nested repeat blocks) from a source training event to a target training event. The source event (eventId) must have a workout, and the target event (targetTrainingId) must not have a workout. The workout is completely duplicated including all step types, durations, targets, and repeat blocks. Uses CASL authorization to verify that the user has read access to the source event and update access to the target event.',
+  })
+  @ApiParam({
+    name: 'eventId',
+    type: Number,
+    description: 'ID of the source training event with workout',
+    example: 1,
+  })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        targetTrainingId: {
+          type: 'number',
+          description: 'ID of the target training event to copy the workout to',
+          example: 2,
+        },
+      },
+      required: ['targetTrainingId'],
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Workout duplicated successfully',
+    schema: {
+      type: 'object',
+      description:
+        'Complete target training event object with duplicated workout',
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description:
+      'Bad request - validation error or target training already has a workout',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 403,
+    description:
+      'Forbidden - user does not have read access to source event or update access to target event',
+  })
+  @ApiResponse({
+    status: 404,
+    description:
+      'Not found - source training event with workout not found or target training event not found',
+  })
+  duplicateWorkout(
+    @JwtUser() user: AuthUser,
+    @Param('eventId', ParseIntPipe) eventId: Event['eventId'],
+    @Body(new ZodValidationPipe(duplicateWorkoutSchema))
+    dto: DuplicateWorkoutDto,
+  ) {
+    return this.eventService.duplicateWorkout(user, eventId, dto);
+  }
+}

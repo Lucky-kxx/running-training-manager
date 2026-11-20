@@ -1,0 +1,237 @@
+import { useLoginMutation } from '@/api/auth';
+import { AuthAPI } from '@/api/auth/auth.api';
+import { useInstanceInfoQuery } from '@/api/instance';
+import { useCreateAccountMutation } from '@/api/user';
+import { FormProvider, RHFTextField } from '@/components/hook-form';
+import { RHFCheckbox } from '@/components/hook-form/rhf-checkbox';
+import { Button } from '@/components/ui/button';
+import { useAuthContext } from '@/contexts/auth';
+import { m } from '@/paraglide/messages';
+import { getPath } from '@/routes/paths';
+import { readPendingClubJoinToken } from '@/utils/club-join';
+import { currentLanguage } from '@/utils/language-choice';
+import { localizedNewPasswordSchema } from '@/utils/password';
+import { localizedPersonNameSchema } from '@/utils/person-name';
+import { RETURN_TO_PARAM, rememberReturnTo } from '@/utils/return-to';
+import { cn } from '@/utils/shadcn';
+import { signupRefusal } from '@/utils/signup';
+import { OAuthButtons } from '@/views/auth/oauth-buttons';
+import { zodResolver } from '@hookform/resolvers/zod';
+import { isAxiosError } from 'axios';
+import { usePostHog } from 'posthog-js/react';
+import { useEffect, useState } from 'react';
+import { useForm } from 'react-hook-form';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { toast } from 'sonner';
+import z from 'zod';
+
+import { createAccountDtoSchema } from '@openathlete/shared';
+
+const PLAN_TOKEN_STORAGE_KEY = 'pendingPlanToken';
+
+export function CreateAccountView({ className }: React.ComponentProps<'form'>) {
+  const { initialize } = useAuthContext();
+  const navigate = useNavigate();
+  const posthog = usePostHog();
+  const [searchParams] = useSearchParams();
+  const invitationToken = searchParams.get('invitation');
+  const coachInvitationToken = searchParams.get('coach-invitation');
+  // A club link opened before signing up: on an invite-only instance it
+  // opens the form, and the club is joined once signed in
+  const [clubJoinToken] = useState(readPendingClubJoinToken);
+  const planToken = searchParams.get('planToken');
+  const [invitationEmail, setInvitationEmail] = useState<string | null>(null);
+  const [isVerifyingInvitation, setIsVerifyingInvitation] = useState(false);
+  const methods = useForm<z.infer<typeof createAccountDtoSchema>>({
+    resolver: zodResolver(
+      createAccountDtoSchema.extend({
+        password: localizedNewPasswordSchema(),
+        firstName: localizedPersonNameSchema(),
+        lastName: localizedPersonNameSchema(),
+      }),
+    ),
+    defaultValues: {
+      email: '',
+      password: '',
+      firstName: '',
+      lastName: '',
+      invitationToken: invitationToken || undefined,
+      coachInvitationToken: coachInvitationToken || undefined,
+      // Consent to news must be given, never assumed (CNIL)
+      emailNews: false,
+    },
+  });
+
+  const returnTo = searchParams.get(RETURN_TO_PARAM);
+
+  // Store planToken in sessionStorage if present
+  useEffect(() => {
+    if (planToken) {
+      sessionStorage.setItem(PLAN_TOKEN_STORAGE_KEY, planToken);
+    }
+  }, [planToken]);
+
+  // Followed once onboarding is done
+  useEffect(() => rememberReturnTo(returnTo), [returnTo]);
+
+  useEffect(() => {
+    const token = invitationToken || coachInvitationToken;
+    if (token) {
+      setIsVerifyingInvitation(true);
+      AuthAPI.verifyInvitation(token)
+        .then((result) => {
+          if (result.valid && result.email) {
+            setInvitationEmail(result.email);
+            methods.setValue('email', result.email);
+          }
+        })
+        .finally(() => {
+          setIsVerifyingInvitation(false);
+        });
+    }
+  }, [invitationToken, coachInvitationToken, methods]);
+
+  const loginMutation = useLoginMutation({
+    onSuccess: async () => {
+      await initialize();
+      navigate(getPath(['dashboard', 'onboarding']));
+    },
+    onError: () => toast.error(m.signup_login_failed()),
+  });
+  const createAccountMutation = useCreateAccountMutation({
+    onSuccess: async (_, variables) => {
+      posthog?.capture('user_signed_up');
+      loginMutation.mutate(variables);
+    },
+    onError: (error) =>
+      toast.error(
+        signupRefusal(error) ??
+          (isAxiosError(error) && error.response?.status === 409
+            ? m.signup_email_exists()
+            : m.signup_failed()),
+      ),
+  });
+  const { data: instance } = useInstanceInfoQuery();
+  const signup = instance?.signup ?? 'open';
+  // In invite mode, the link of an invitation still opens the form
+  const signupBlocked =
+    signup === 'closed' ||
+    (signup === 'invite' &&
+      !invitationToken &&
+      !coachInvitationToken &&
+      !clubJoinToken);
+
+  const { handleSubmit } = methods;
+
+  const onSubmit = handleSubmit(async (data) => {
+    const submitData = {
+      ...data,
+      invitationToken: invitationToken || undefined,
+      coachInvitationToken: coachInvitationToken || undefined,
+      clubJoinToken: clubJoinToken ?? undefined,
+      // Emails, starting with the welcome one, follow the app's language
+      language: currentLanguage(),
+    };
+    createAccountMutation.mutate(submitData);
+  });
+
+  if (signupBlocked) {
+    return (
+      <div
+        className={cn('flex flex-col gap-6 text-center', className)}
+        data-signup-blocked={signup}
+      >
+        <h1 className="text-2xl font-bold">{m.create_an_account()}</h1>
+        <p className="text-muted-foreground text-sm text-balance">
+          {signup === 'closed'
+            ? m.signup_closed_message()
+            : m.signup_invite_only_message()}
+        </p>
+        <div className="text-sm">
+          {m.already_have_account()}{' '}
+          <Link to="/auth/login" className="underline underline-offset-4">
+            {m.login()}
+          </Link>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <FormProvider
+      methods={methods}
+      onSubmit={onSubmit}
+      className={cn('flex flex-col gap-6', className)}
+    >
+      <div className="flex flex-col items-center gap-2 text-center">
+        <h1 className="text-2xl font-bold">{m.create_an_account()}</h1>
+        <p className="text-muted-foreground text-sm text-balance">
+          {invitationEmail
+            ? m.create_account_from_invitation()
+            : m.enter_details_to_create_account()}
+        </p>
+      </div>
+      {isVerifyingInvitation && (
+        <p className="text-sm text-muted-foreground text-center">
+          {m.verifying_invitation()}
+        </p>
+      )}
+      <div className="grid gap-6">
+        <RHFTextField
+          name="firstName"
+          type="text"
+          placeholder={m.first_name_placeholder()}
+          label={m.first_name()}
+          required
+        />
+        <RHFTextField
+          name="lastName"
+          type="text"
+          placeholder={m.last_name_placeholder()}
+          label={m.last_name()}
+          required
+        />
+        <RHFTextField
+          name="email"
+          type="email"
+          placeholder={m.email_placeholder()}
+          label={m.email()}
+          required
+          disabled={!!invitationEmail}
+        />
+        <RHFTextField
+          name="password"
+          type="password"
+          required
+          label={m.password()}
+        />
+        {instance?.personalEmails && (
+          <RHFCheckbox name="emailNews" label={m.signup_email_news()} />
+        )}
+        <Button
+          type="submit"
+          className="w-full"
+          onClick={onSubmit}
+          isLoading={
+            createAccountMutation.isPending ||
+            loginMutation.isPending ||
+            isVerifyingInvitation
+          }
+        >
+          {m.create_account()}
+        </Button>
+        <OAuthButtons
+          invitationToken={invitationToken}
+          coachInvitationToken={coachInvitationToken}
+          redirectTo={getPath(['dashboard'])}
+        />
+      </div>
+      <div className="text-center text-sm">
+        {m.already_have_account()}{' '}
+        <Link to="/auth/login" className="underline underline-offset-4">
+          {m.login()}
+        </Link>
+      </div>
+    </FormProvider>
+  );
+}

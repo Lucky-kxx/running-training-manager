@@ -1,0 +1,12 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../../generated/client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Models are split across multiple files in this directory (athlete.prisma, event.prisma, etc.).
+// Prisma is configured in this repo to load all .prisma files under prisma/schema.

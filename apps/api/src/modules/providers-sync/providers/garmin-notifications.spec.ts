@@ -1,0 +1,473 @@
+import axios from 'axios';
+
+import { ProviderAccount } from '@openathlete/database';
+
+import { GarminActivityNotSavedError } from '../errors/garmin-activity-not-saved.error';
+import {
+  GarminProviderService,
+  garminDeviceName,
+  garminSharesHistory,
+  parseGarminNotifications,
+  toImportedGarminActivity,
+} from './garmin.provider.service';
+
+// The FIT SDK is ESM, which Jest cannot load
+jest.mock('../../core/helpers/activity-file-parser.service', () => ({
+  ActivityFileParserService: class {},
+}));
+
+jest.mock('axios', () => {
+  const actual = jest.requireActual('axios');
+  return {
+    __esModule: true,
+    ...actual,
+    default: { ...actual, get: jest.fn(), delete: jest.fn() },
+  };
+});
+
+const mockedGet = axios.get as jest.Mock;
+const mockedDelete = axios.delete as jest.Mock;
+
+describe('garminDeviceName', () => {
+  it('keeps the model, without the brand the attribution adds', () => {
+    expect(garminDeviceName('Forerunner 965')).toBe('Forerunner 965');
+    expect(garminDeviceName(' Garmin fenix 8 ')).toBe('fenix 8');
+  });
+
+  it('drops the model of manual activities and missing ones', () => {
+    expect(garminDeviceName('unknown')).toBeNull();
+    expect(garminDeviceName('')).toBeNull();
+    expect(garminDeviceName(undefined)).toBeNull();
+  });
+});
+
+describe('parseGarminNotifications', () => {
+  it('queues pings and pushes, but not deregistrations', () => {
+    const jobs = parseGarminNotifications({
+      dailies: [
+        { userId: 'u1', callbackURL: 'https://apis.garmin.com/x?token=t' },
+      ],
+      sleeps: [{ userId: 'u1', summaryId: 's1', durationInSeconds: 3600 }],
+      deregistrations: [{ userId: 'u2' }],
+      epochs: [{ userId: 'u1', summaryId: 'e1', steps: 12 }],
+      activities: [{ callbackURL: 'https://apis.garmin.com/y' }],
+    });
+
+    expect(jobs.map((job) => job.summaryType)).toEqual([
+      'dailies',
+      'sleeps',
+      'epochs',
+    ]);
+    expect(jobs[0].callbackURL).toBe('https://apis.garmin.com/x?token=t');
+    expect(jobs[1].entry).toMatchObject({ durationInSeconds: 3600 });
+    // Pushed data that is never saved is not kept in the queue
+    expect(jobs[2].entry).toEqual({});
+  });
+});
+
+describe('toImportedGarminActivity', () => {
+  it('keeps the UTC start time, not the device local time', () => {
+    const activity = toImportedGarminActivity({
+      summaryId: '1',
+      activityId: '123',
+      activityType: 'RUNNING',
+      activityName: 'Morning run',
+      startTimeInSeconds: 1_700_000_000,
+      startTimeOffsetInSeconds: 7200,
+      durationInSeconds: 1800,
+    });
+
+    expect(activity?.externalId).toBe('123');
+    expect(activity?.startDate.toISOString()).toBe('2023-11-14T22:13:20.000Z');
+    expect(activity?.endDate.getTime()).toBe(1_700_001_800_000);
+  });
+});
+
+describe('GarminProviderService.processNotification', () => {
+  const account = {
+    providerAccountId: 1,
+    athleteId: 7,
+    status: 'active',
+    externalUserId: 'u1',
+    accessToken: 'access',
+    refreshToken: 'refresh',
+    expiresAt: new Date(Date.now() + 3600_000),
+    importActivitiesEnabled: true,
+    importMetricsEnabled: true,
+  } as unknown as ProviderAccount;
+
+  function setup(accounts: ProviderAccount[]) {
+    const prisma = {
+      providerAccount: {
+        findMany: jest.fn().mockResolvedValue(accounts),
+        update: jest.fn(),
+      },
+      athleteMetric: { upsert: jest.fn((args) => args) },
+      eventActivity: { findMany: jest.fn().mockResolvedValue([]) },
+      $transaction: jest.fn(),
+    };
+    const config = { get: jest.fn() };
+    const queue = { addActivityImportJobs: jest.fn() };
+    const service = new GarminProviderService(
+      prisma as never,
+      config as never,
+      queue as never,
+      {} as never,
+    );
+    return { service, prisma, queue };
+  }
+
+  beforeEach(() => mockedGet.mockReset());
+
+  it('pulls the callback as Garmin built it, with the access token', async () => {
+    const { service, prisma } = setup([account]);
+    mockedGet.mockResolvedValue({
+      data: [{ summaryId: 'd', calendarDate: '2026-10-27', steps: 1000 }],
+    });
+
+    await service.processNotification(
+      {
+        summaryType: 'dailies',
+        userId: 'u1',
+        callbackURL:
+          'https://apis.garmin.com/wellness-api/rest/dailies?uploadStartTimeInSeconds=1&uploadEndTimeInSeconds=2&token=abc',
+        entry: {},
+      },
+      { lastAttempt: false },
+    );
+
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+    const [url, options] = mockedGet.mock.calls[0];
+    expect(url).toContain('token=abc');
+    expect(options.headers).toEqual({ Authorization: 'Bearer access' });
+    expect(prisma.$transaction).toHaveBeenCalled();
+  });
+
+  it('fails the job when Garmin refuses the pull, instead of dropping the data', async () => {
+    const { service, prisma } = setup([account]);
+    mockedGet.mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 400'), {
+        isAxiosError: true,
+        response: { status: 400, data: { errorMessage: 'bad request' } },
+      }),
+    );
+
+    await expect(
+      service.processNotification(
+        {
+          summaryType: 'activities',
+          userId: 'u1',
+          callbackURL:
+            'https://apis.garmin.com/wellness-api/rest/activities?token=abc',
+          entry: {},
+        },
+        { lastAttempt: false },
+      ),
+    ).rejects.toThrow('status code 400');
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('answers pings of unknown users without saving anything', async () => {
+    const { service, prisma } = setup([]);
+    mockedGet.mockResolvedValue({ data: [] });
+
+    await service.processNotification(
+      {
+        summaryType: 'sleeps',
+        userId: 'gone',
+        callbackURL: 'https://apis.garmin.com/wellness-api/rest/sleeps?token=t',
+        entry: {},
+      },
+      { lastAttempt: false },
+    );
+
+    expect(mockedGet).toHaveBeenCalledTimes(1);
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('drops activity files of unknown users, which no retry can pull', async () => {
+    const { service } = setup([]);
+    mockedGet.mockRejectedValue(
+      Object.assign(new Error('Bad Request'), {
+        isAxiosError: true,
+        response: { status: 400, data: {} },
+      }),
+    );
+
+    await expect(
+      service.processNotification(
+        {
+          summaryType: 'activityFiles',
+          userId: 'gone',
+          callbackURL:
+            'https://apis.garmin.com/wellness-api/rest/activityFile?id=1&token=t',
+          entry: { fileType: 'FIT', activityId: 1 },
+        },
+        { lastAttempt: false },
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  describe('an activity file that arrives before its activity', () => {
+    const fileNotification = {
+      summaryType: 'activityFiles',
+      userId: 'u1',
+      callbackURL:
+        'https://apis.garmin.com/wellness-api/rest/activityFile?id=9&token=t',
+      entry: { fileType: 'FIT', activityId: 9 },
+    };
+
+    function setupWithoutActivity() {
+      const context = setup([account]);
+      Object.assign(context.prisma.eventActivity, {
+        findFirst: jest.fn().mockResolvedValue(null),
+      });
+      return context;
+    }
+
+    it('waits for the import without pulling the file', async () => {
+      const { service } = setupWithoutActivity();
+
+      await expect(
+        service.processNotification(fileNotification, { lastAttempt: false }),
+      ).rejects.toBeInstanceOf(GarminActivityNotSavedError);
+      expect(mockedGet).not.toHaveBeenCalled();
+    });
+
+    it('answers the ping on the last attempt and says the file is dropped', async () => {
+      const { service } = setupWithoutActivity();
+      const warn = jest
+        .spyOn(service['logger'], 'warn')
+        .mockImplementation(() => undefined);
+      mockedGet.mockResolvedValue({ data: new ArrayBuffer(8) });
+
+      await service.processNotification(fileNotification, {
+        lastAttempt: true,
+      });
+
+      expect(mockedGet).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('Garmin activity 9 was still not saved'),
+      );
+    });
+  });
+
+  it('deregisters a revoked account still holding a refresh token', async () => {
+    const revoked = { ...account, status: 'revoked' } as ProviderAccount;
+    const { service } = setup([revoked]);
+    jest
+      .spyOn(service, 'refreshAccessToken')
+      .mockResolvedValue({ access_token: 'fresh' });
+    mockedDelete.mockResolvedValue({ status: 204 });
+
+    await service.deleteUserRegistration(revoked);
+
+    expect(mockedDelete).toHaveBeenCalledWith(
+      expect.stringContaining('/registration'),
+      expect.objectContaining({
+        headers: { Authorization: 'Bearer fresh' },
+      }),
+    );
+  });
+
+  it('keeps the refresh token to deregister later when Garmin fails', async () => {
+    const { service, prisma } = setup([account]);
+    jest.spyOn(service, 'getValidAccessToken').mockResolvedValue('token');
+    mockedDelete.mockRejectedValue(new Error('Garmin is down'));
+
+    await service.disconnect(account);
+
+    const { data } = prisma.providerAccount.update.mock.calls[0][0];
+    expect(data.status).toBe('revoked');
+    expect(data).not.toHaveProperty('refreshToken');
+  });
+
+  it('forgets a refresh token Garmin rejected: it can never deregister', async () => {
+    const revoked = { ...account, status: 'revoked' } as ProviderAccount;
+    const { service, prisma } = setup([revoked]);
+    jest.spyOn(service, 'refreshAccessToken').mockRejectedValue(
+      Object.assign(new Error('Request failed with status code 400'), {
+        isAxiosError: true,
+        response: { status: 400, data: { error: 'invalid_grant' } },
+      }),
+    );
+
+    await service.disconnect(revoked);
+
+    const { data } = prisma.providerAccount.update.mock.calls[0][0];
+    expect(data.refreshToken).toBeNull();
+  });
+
+  it('saves pushed data without pulling anything', async () => {
+    const { service, prisma } = setup([account]);
+
+    await service.processNotification(
+      {
+        summaryType: 'dailies',
+        userId: 'u1',
+        entry: { summaryId: 'd', calendarDate: '2026-10-27', steps: 1000 },
+      },
+      { lastAttempt: false },
+    );
+
+    expect(mockedGet).not.toHaveBeenCalled();
+    expect(prisma.$transaction).toHaveBeenCalled();
+    // Labelled as Garmin's, for the attribution the app shows
+    expect(prisma.athleteMetric.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        create: expect.objectContaining({ source: 'GARMIN' }),
+        update: expect.objectContaining({ source: 'GARMIN' }),
+      }),
+    );
+  });
+
+  it('drops pushed data of unknown users, with nothing left to answer', async () => {
+    const { service, prisma } = setup([]);
+
+    await service.processNotification(
+      {
+        summaryType: 'dailies',
+        userId: 'gone',
+        entry: { summaryId: 'd', calendarDate: '2026-10-27', steps: 1000 },
+      },
+      { lastAttempt: false },
+    );
+
+    expect(mockedGet).not.toHaveBeenCalled();
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('refuses callback URLs outside Garmin', async () => {
+    const { service } = setup([account]);
+
+    await expect(
+      service.processNotification(
+        {
+          summaryType: 'dailies',
+          userId: 'u1',
+          callbackURL: 'https://evil.example/steal?token=t',
+          entry: {},
+        },
+        { lastAttempt: false },
+      ),
+    ).rejects.toThrow('Invalid Garmin callbackURL');
+    expect(mockedGet).not.toHaveBeenCalled();
+  });
+
+  it('advances past a conflicting window when Garmin answers 409', async () => {
+    const conflictStart = new Date(Date.now() - 33 * 24 * 3600 * 1000);
+    const conflictEnd = new Date(Date.now() - 3 * 24 * 3600 * 1000);
+    const garminAccount = {
+      ...account,
+      scopes: 'permissions:ACTIVITY_EXPORT',
+    } as unknown as ProviderAccount;
+    const { service } = setup([garminAccount]);
+
+    mockedGet
+      .mockRejectedValueOnce(
+        Object.assign(new Error('Conflict'), {
+          isAxiosError: true,
+          response: {
+            status: 409,
+            data: {
+              errorMessage: `[1cf00fd8-6c33-4b7f-8e81-4991aa8473bb]duplicate backfill processed at ${conflictEnd.toISOString()} [${conflictStart.toISOString()} to ${conflictEnd.toISOString()}]`,
+            },
+          },
+        }),
+      )
+      .mockResolvedValueOnce({ status: 202, data: '' });
+
+    await expect(service.queueFullImport(garminAccount)).resolves.toEqual({
+      queuedActivities: 0,
+      backfillRequested: true,
+    });
+
+    expect(mockedGet).toHaveBeenCalledTimes(2);
+    expect(mockedGet.mock.calls[1][1].params.summaryStartTimeInSeconds).toBe(
+      Math.floor(conflictEnd.getTime() / 1000),
+    );
+  });
+
+  it('asks for as much history as Garmin serves, just under 31 days', async () => {
+    const sharingAccount = {
+      ...account,
+      scopes: 'permissions:ACTIVITY_EXPORT',
+    } as unknown as ProviderAccount;
+    const { service } = setup([sharingAccount]);
+    mockedGet.mockResolvedValue({ status: 202, data: '' });
+
+    await service.queueFullImport(sharingAccount);
+
+    const { summaryStartTimeInSeconds, summaryEndTimeInSeconds } =
+      mockedGet.mock.calls[0][1].params;
+    const days = (summaryEndTimeInSeconds - summaryStartTimeInSeconds) / 86400;
+    expect(days).toBeGreaterThan(30.9);
+    expect(days).toBeLessThan(31);
+  });
+
+  it('imports backfilled activities as history, recent ones as new', async () => {
+    const { service, queue } = setup([account]);
+    const now = Math.floor(Date.now() / 1000);
+    mockedGet.mockResolvedValue({
+      data: [
+        {
+          summaryId: 'a',
+          activityId: 1,
+          activityType: 'RUNNING',
+          startTimeInSeconds: now - 3600,
+          durationInSeconds: 1800,
+        },
+        {
+          summaryId: 'b',
+          activityId: 2,
+          activityType: 'RUNNING',
+          startTimeInSeconds: now - 400 * 24 * 3600,
+          durationInSeconds: 1800,
+        },
+      ],
+    });
+
+    await service.processNotification(
+      {
+        summaryType: 'activities',
+        userId: 'u1',
+        callbackURL:
+          'https://apis.garmin.com/wellness-api/rest/activities?token=abc',
+        entry: {},
+      },
+      { lastAttempt: false },
+    );
+
+    const calls = queue.addActivityImportJobs.mock.calls as [
+      unknown,
+      { externalId: string }[],
+      boolean,
+    ][];
+    const byBulk = Object.fromEntries(
+      calls.map(([, activities, bulk]) => [
+        String(bulk),
+        activities.map((activity) => activity.externalId),
+      ]),
+    );
+    expect(byBulk).toEqual({ false: ['1'], true: ['2'] });
+  });
+});
+
+describe('garminSharesHistory', () => {
+  it('is false when the user did not allow the history', () => {
+    expect(
+      garminSharesHistory('permissions:ACTIVITY_EXPORT HEALTH_EXPORT'),
+    ).toBe(false);
+  });
+
+  it('is true when they did', () => {
+    expect(
+      garminSharesHistory('permissions:ACTIVITY_EXPORT HISTORICAL_DATA_EXPORT'),
+    ).toBe(true);
+  });
+
+  it('leaves it to Garmin while the permissions are unknown', () => {
+    expect(garminSharesHistory(null)).toBe(true);
+    expect(garminSharesHistory('PARTNER_READ CONNECT_READ')).toBe(true);
+  });
+});

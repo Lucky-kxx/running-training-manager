@@ -1,0 +1,216 @@
+import { type Page, expect, test } from '@playwright/test';
+
+import {
+  type TestUser,
+  apiHeaders,
+  createCoachWithAthlete,
+} from '../../support/api';
+import { signIn } from '../../support/browser';
+import { API_URL } from '../../support/env';
+import { trackPageProblems } from '../../support/page-health';
+
+test.use({ storageState: { cookies: [], origins: [] } });
+
+// The browser remembers the coach space, as after switching to it once
+async function signInAsCoach(page: Page, coach: TestUser) {
+  await signIn(page, coach);
+  await page.addInitScript(() => {
+    localStorage.setItem('current_space', 'COACH');
+  });
+}
+
+test('the coach dashboard lists a linked athlete and opens their calendar', async ({
+  page,
+  request,
+}) => {
+  const { coach, athlete, athleteId } = await createCoachWithAthlete(request);
+  await signInAsCoach(page, coach);
+  const problems = trackPageProblems(page);
+
+  await page.goto('/dashboard/coach');
+  await expect(page.getByText(athlete.email)).toBeVisible();
+  // The dashboard holds a table for wide screens and cards for phones
+  await page.locator('[data-coach-table]').getByTitle('View calendar').click();
+
+  await expect(page).toHaveURL(new RegExp(`/dashboard/calendar/${athleteId}$`));
+  expect(problems).toEqual([]);
+});
+
+test('a coach deletes several planned workouts at once', async ({
+  page,
+  request,
+}) => {
+  const { coach, athleteId } = await createCoachWithAthlete(request);
+  const headers = apiHeaders(undefined, coach.accessToken);
+  // Mid-month as the browser sees it (playwright.config's time zone), so
+  // the month the calendar opens on holds all three
+  const [month, , year] = new Date()
+    .toLocaleDateString('en-US', { timeZone: 'America/New_York' })
+    .split('/')
+    .map(Number);
+  for (const [day, name] of [
+    'Easy run A',
+    'Easy run B',
+    'Easy run C',
+  ].entries()) {
+    const start = new Date(Date.UTC(year, month - 1, 10 + day, 16));
+    const planned = await request.post(`${API_URL}/event`, {
+      headers,
+      data: {
+        type: 'TRAINING',
+        athleteId,
+        name,
+        sport: 'RUNNING',
+        description: '',
+        startDate: start.toISOString(),
+        endDate: new Date(start.getTime() + 60 * 60 * 1000).toISOString(),
+      },
+    });
+    expect(planned.status(), await planned.text()).toBe(201);
+  }
+  await signInAsCoach(page, coach);
+
+  await page.goto(`/dashboard/calendar/${athleteId}`);
+  await page.getByRole('button', { name: 'Select workouts' }).click();
+  await page.getByRole('checkbox', { name: 'Select Easy run A' }).check();
+  await page.getByRole('checkbox', { name: 'Select Easy run B' }).check();
+  await expect(page.getByText('2 workouts selected')).toBeVisible();
+  await page.getByRole('button', { name: 'Delete selected' }).click();
+
+  // The names are reviewed before anything is deleted
+  const confirm = page.getByRole('dialog');
+  await expect(confirm).toContainText('Easy run A');
+  await expect(confirm).toContainText('Easy run B');
+  await expect(confirm).not.toContainText('Easy run C');
+  await confirm.locator('[data-bulk-delete-confirm]').click();
+
+  await expect(page.getByText('Deleted 2 workouts.')).toBeVisible();
+  const events = await request.get(
+    `${API_URL}/event?coach=true&athleteId=${athleteId}`,
+    { headers },
+  );
+  expect(events.status(), await events.text()).toBe(200);
+  const names = ((await events.json()) as { name: string }[]).map(
+    (event) => event.name,
+  );
+  expect(names).toEqual(['Easy run C']);
+});
+
+test('a coach moves several planned workouts a day later', async ({
+  page,
+  request,
+}) => {
+  const { coach, athleteId } = await createCoachWithAthlete(request);
+  const headers = apiHeaders(undefined, coach.accessToken);
+  // Mid-month as the browser sees it, so the moved sessions stay in view
+  const [month, , year] = new Date()
+    .toLocaleDateString('en-US', { timeZone: 'America/New_York' })
+    .split('/')
+    .map(Number);
+  for (const [day, name] of ['Tempo A', 'Tempo B'].entries()) {
+    const start = new Date(Date.UTC(year, month - 1, 10 + day, 16));
+    const planned = await request.post(`${API_URL}/event`, {
+      headers,
+      data: {
+        type: 'TRAINING',
+        athleteId,
+        name,
+        sport: 'RUNNING',
+        description: '',
+        startDate: start.toISOString(),
+        endDate: new Date(start.getTime() + 60 * 60 * 1000).toISOString(),
+      },
+    });
+    expect(planned.status(), await planned.text()).toBe(201);
+  }
+  await signInAsCoach(page, coach);
+  const problems = trackPageProblems(page);
+
+  await page.goto(`/dashboard/calendar/${athleteId}`);
+  await page.getByRole('button', { name: 'Select workouts' }).click();
+  await page.getByRole('checkbox', { name: 'Select Tempo A' }).check();
+  await page.getByRole('checkbox', { name: 'Select Tempo B' }).check();
+  await page.locator('[data-bulk-move]').click();
+  await page.getByRole('menuitem', { name: 'One day later' }).click();
+
+  await expect(page.getByText('Items moved: 2')).toBeVisible();
+  const events = await request.get(
+    `${API_URL}/event?coach=true&athleteId=${athleteId}`,
+    { headers },
+  );
+  const days = ((await events.json()) as { startDate: string }[])
+    .map((event) => new Date(event.startDate).getUTCDate())
+    .sort((a, b) => a - b);
+  expect(days).toEqual([11, 12]);
+  expect(problems).toEqual([]);
+});
+
+test("a coach keeps private notes on an athlete, which the athlete can't read", async ({
+  page,
+  request,
+}) => {
+  const { coach, athlete, athleteId } = await createCoachWithAthlete(request);
+  await signInAsCoach(page, coach);
+  const problems = trackPageProblems(page);
+
+  await page.goto(`/dashboard/notes/${athleteId}`);
+  await page.getByRole('button', { name: 'New note' }).click();
+  await page.getByLabel('Title').fill('Running form');
+  await page
+    .getByRole('textbox', { name: 'Note', exact: true })
+    .fill('Drills to review: https://video.example/drills');
+  await page.getByRole('button', { name: 'Save' }).click();
+
+  await expect(page.getByText('Running form')).toBeVisible();
+  await expect(
+    page.getByRole('link', { name: 'https://video.example/drills' }),
+  ).toHaveAttribute('href', 'https://video.example/drills');
+  // The general notes list it too, with the athlete it is about
+  await page.goto('/dashboard/notes');
+  await page.getByRole('tab', { name: 'Notes' }).click();
+  await expect(page.getByText('Running form')).toBeVisible();
+  expect(problems).toEqual([]);
+
+  // The athlete reads only their own notes, none about them
+  const notes = await request.get(`${API_URL}/coach-notes`, {
+    headers: apiHeaders(undefined, athlete.accessToken),
+  });
+  expect(notes.status()).toBe(200);
+  expect(await notes.json()).toEqual([]);
+  const own = await request.get(
+    `${API_URL}/coach-notes?athleteId=${athleteId}`,
+    { headers: apiHeaders(undefined, athlete.accessToken) },
+  );
+  expect(await own.json()).toEqual([]);
+});
+
+test('a coach writes in their general notebook, saved as they type', async ({
+  page,
+  request,
+}) => {
+  const { coach } = await createCoachWithAthlete(request);
+  await signInAsCoach(page, coach);
+  const problems = trackPageProblems(page);
+
+  await page.goto('/dashboard/notes');
+  await page.getByText('Your notebook is empty: start writing.').click();
+  await page
+    .getByRole('textbox', { name: 'Notebook' })
+    .fill('Warm-up for everyone: https://video.example/warmup');
+  await expect(page.getByText('Saved', { exact: true })).toBeVisible();
+  // Without a bucket, the instance offers no images
+  await expect(page.getByRole('button', { name: 'Add an image' })).toHaveCount(
+    0,
+  );
+  await page.getByRole('button', { name: 'Done' }).click();
+  await expect(
+    page.getByRole('link', { name: 'https://video.example/warmup' }),
+  ).toBeVisible();
+
+  // Still there after a reload
+  await page.reload();
+  await expect(
+    page.getByRole('link', { name: 'https://video.example/warmup' }),
+  ).toBeVisible();
+  expect(problems).toEqual([]);
+});

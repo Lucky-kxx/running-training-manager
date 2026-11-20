@@ -1,0 +1,72 @@
+// ============================================================================
+// Record Models
+// ============================================================================
+// Personal records (PRs) for athletes. Tracks best performances at specific
+// distances for various metrics (speed, heart rate, power, elevation, cadence).
+// Records are automatically extracted from activities.
+// ============================================================================
+
+/// Personal record.
+/// Represents a best performance at a specific distance for a metric type.
+/// Records are automatically calculated from activities and track the best
+/// value achieved within a distance range (e.g., best 5K time, max heart rate at 10K).
+model Record {
+  // primary key
+  recordId Int @id @default(autoincrement()) @map("record_id")
+
+  // fields
+  /// Distance in meters the record covers: pace and climbing records
+  distance      Float?
+  /// Duration in seconds the record covers: power and heart rate records
+  duration      Int?
+  /// Date when the record was achieved
+  date          DateTime
+  /// Start duration in seconds (for time-based records, when the segment started)
+  startDuration Int?       @map("start_duration")
+  /// End duration in seconds (for time-based records, when the segment ended)
+  endDuration   Int?       @map("end_duration")
+  /// Record type: SPEED, HEARTRATE, POWER, ELEVATION_GAIN, ELEVATION_LOSS, or CADENCE
+  type          RecordType
+  /// Record value (units depend on type: m/s for speed, bpm for heart rate, etc.)
+  value         Float
+
+  // relationships
+  eventActivity   EventActivity? @relation(fields: [eventActivityId], references: [eventActivityId])
+  eventActivityId Int?           @map("event_activity_id")
+  athlete         Athlete        @relation(fields: [athleteId], references: [athleteId])
+  athleteId       Int            @map("athlete_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([athleteId, type, date])
+  @@index([eventActivityId])
+  @@map("record")
+}
+
+/// An effort the athlete or their coach set aside from their records: a GPS
+/// jump, a faulty sensor, a ride filed as a run. Records are deleted and
+/// recomputed with their activity, so this points at the activity and at what
+/// to skip in it, never at a record row.
+/// No type: the whole activity. A type alone: all of it in the activity. With
+/// a distance or a duration: that one effort.
+model RecordExclusion {
+  // primary key
+  recordExclusionId Int @id @default(autoincrement()) @map("record_exclusion_id")
+
+  // fields
+  type     RecordType?
+  distance Float?
+  duration Int?
+
+  // relationships
+  eventActivity   EventActivity @relation(fields: [eventActivityId], references: [eventActivityId], onDelete: Cascade)
+  eventActivityId Int           @map("event_activity_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([eventActivityId])
+  @@map("record_exclusion")
+}

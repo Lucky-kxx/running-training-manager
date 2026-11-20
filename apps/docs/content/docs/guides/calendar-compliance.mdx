@@ -1,0 +1,61 @@
+---
+title: Done against planned
+description: How the calendar grades sessions and sums up each week.
+---
+
+## Colours on the cards
+
+A planned session gets a coloured strip on its left once it can be judged:
+
+| Strip | Meaning |
+| --- | --- |
+| Green | Done within 20% of the planned duration |
+| Yellow | Done at 50 to 79%, or 121 to 150%, of the plan |
+| Orange | Done more than 50% away from the plan |
+| Red | Missed: its day is over and no activity is linked |
+
+The duration is compared first; sessions planned only in distance are
+compared on distance. A session done without a duration or distance goal is
+green. Sessions still to do, and activities done without a plan, have no
+strip. The tooltip of a card gives the status and the percentage.
+
+The strip needs the activity to be linked to its session. Synced activities
+are linked automatically when they match a session of the same day; otherwise
+drag the activity onto its session, or see
+[Link a completed activity to a session](/docs/guides/link-activity-suggestions).
+
+## Weekly summary
+
+Next to each week (or below it, in the week view), the summary shows:
+
+- duration, distance and elevation, **done / planned**, with a progress bar;
+- the training load done / planned against the recommended range: the
+  lighter part of the bar is the load still planned. Bars under it show the
+  load day by day, lighter for the sessions still to do;
+- the sessions done, missed and still to do;
+- **TSB**, the form at the end of the week (fitness minus fatigue), marked
+  *projected* until the week is over.
+
+The **Display** menu (gear icon) chooses which of these rows show. The chart
+of weekly load and form over several months is in the
+[season view](/docs/guides/calendar-season-and-display).
+
+## How planned load is estimated
+
+Planned sessions and races are estimated in the same unit as the load of your
+activities (Banister TRIMP), using the first method that applies:
+
+1. **Workout heart-rate targets**: if every timed step of a structured workout
+   has a heart-rate target (explicit bpm, heart-rate zone, % HR max, or % HR
+   reserve), load is summed step by step over the workout.
+2. **AI fallback**: if a structured workout uses targets that cannot be
+   resolved from heart rate alone (such as pace, power, or distance steps) and
+   AI load estimation is enabled, the AI estimates the session's load.
+3. **Duration and target RPE**: for unstructured sessions, races, or when AI is
+   unavailable, load is estimated from the planned duration and target RPE.
+
+Deterministic estimation (heart-rate targets or duration and RPE) requires
+both your maximum and resting heart rates (`HR_MAX` and `HR_REST`) in
+**Metrics**, plus either heart-rate targets on every workout step (with your
+heart-rate zones configured when steps target zones) or a planned duration and
+target RPE.

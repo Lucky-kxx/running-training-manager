@@ -1,0 +1,515 @@
+import { Server, Socket } from 'socket.io';
+import { z } from 'zod';
+
+import { Logger, OnModuleInit, UseGuards } from '@nestjs/common';
+import { OnEvent } from '@nestjs/event-emitter';
+import {
+  ConnectedSocket,
+  MessageBody,
+  OnGatewayConnection,
+  OnGatewayDisconnect,
+  SubscribeMessage,
+  WebSocketGateway,
+  WebSocketServer,
+} from '@nestjs/websockets';
+
+import type {
+  CreateMessageThreadMessageDto,
+  MarkMessagesAsReadDto,
+  UpdateMessageThreadMessageDto,
+} from '@openathlete/shared';
+import {
+  createMessageThreadMessageDtoSchema,
+  markMessagesAsReadDtoSchema,
+  updateMessageThreadMessageDtoSchema,
+} from '@openathlete/shared';
+
+import { corsOriginValidator } from 'src/common/utils/cors.util';
+import { AuthUser } from 'src/modules/auth/decorators/user.decorator';
+
+import { WebSocketRedisService } from '../../websocket/websocket-redis.service';
+import { WsJwtAuthGuard } from '../guards/ws-jwt-auth.guard';
+import { WsZodValidationPipe } from '../pipes/ws-zod-validation.pipe';
+import {
+  BROADCAST_DELIVERED,
+  BroadcastDeliveredPayload,
+} from '../services/message-broadcast.service';
+import { MessageThreadService } from '../services/message-thread.service';
+import { MessageService } from '../services/message.service';
+
+@WebSocketGateway({
+  cors: {
+    origin: corsOriginValidator,
+    credentials: true,
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  },
+  namespace: '/messages',
+  transports: ['polling', 'websocket'], // Support both transports for proxy compatibility
+  allowEIO3: true, // Allow Engine.IO v3 clients for better compatibility
+})
+export class MessagesGateway
+  implements OnGatewayConnection, OnGatewayDisconnect, OnModuleInit
+{
+  private readonly logger = new Logger(MessagesGateway.name);
+  @WebSocketServer()
+  server!: Server;
+
+  // Map to track user sockets: userId -> Set of socket IDs
+  private userSockets = new Map<number, Set<string>>();
+
+  constructor(
+    private messageService: MessageService,
+    private threadService: MessageThreadService,
+    private webSocketRedisService: WebSocketRedisService,
+  ) {}
+
+  onModuleInit() {
+    // Configure Redis adapter if available (for multi-instance production)
+    // This must be done after the server is initialized
+    const adapter = this.webSocketRedisService.getAdapter();
+    if (adapter && this.server) {
+      // In Socket.IO v4, configure adapter on the main server (not namespace)
+      // The server property is the namespace, so we access the main server via .server
+      const mainServer = (this.server as unknown as { server: Server }).server;
+      if (mainServer && typeof mainServer.adapter === 'function') {
+        mainServer.adapter(adapter);
+      }
+    }
+  }
+
+  @OnEvent('activity.chat.delivered')
+  activityNoticeDelivered(payload: {
+    message: { messageThreadId: number };
+    userIds: number[];
+  }) {
+    if (!this.server) return;
+    for (const userId of payload.userIds)
+      this.server.to(`user:${userId}`).emit('activity_notice', payload);
+  }
+
+  /** A message to several people, sent now or by the scheduler */
+  @OnEvent(BROADCAST_DELIVERED)
+  broadcastDelivered(payload: BroadcastDeliveredPayload) {
+    if (!this.server) return;
+    for (const messageThreadId of payload.messageThreadIds) {
+      this.broadcastToUsers(
+        'thread_updated',
+        { messageThreadId },
+        payload.userIds,
+      );
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('subscribe_inbox')
+  handleSubscribeInbox(@ConnectedSocket() client: Socket) {
+    const user = client.data.user as AuthUser;
+    if (!user) return;
+    this.authenticateAndSetupUser(client, user);
+    client.emit('inbox_subscribed');
+  }
+
+  handleConnection(_: Socket) {
+    // Authentication happens on first message, not on connection
+  }
+
+  /**
+   * Authenticate user and setup their socket room for direct messaging
+   */
+  private authenticateAndSetupUser(client: Socket, user: AuthUser) {
+    if (!this.userSockets.has(user.userId)) {
+      this.userSockets.set(user.userId, new Set());
+    }
+    this.userSockets.get(user.userId)!.add(client.id);
+    client.join(`user:${user.userId}`);
+  }
+
+  handleDisconnect(client: Socket) {
+    for (const [userId, sockets] of this.userSockets.entries()) {
+      if (sockets.has(client.id)) {
+        sockets.delete(client.id);
+        if (sockets.size === 0) {
+          this.userSockets.delete(userId);
+        }
+        break;
+      }
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('send_message')
+  async handleSendMessage(
+    @MessageBody(new WsZodValidationPipe(createMessageThreadMessageDtoSchema))
+    data: CreateMessageThreadMessageDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { messageThreadId, content } = data;
+
+    try {
+      // Extract authenticated user from socket (set by WsJwtAuthGuard)
+      const user = client.data.user as AuthUser;
+
+      if (!user) {
+        this.logger.error('User not authenticated for message send');
+        client.emit('message_error', {
+          error: 'Unauthorized: User not authenticated',
+          messageThreadId,
+        });
+        return;
+      }
+
+      if (!this.userSockets.get(user.userId)?.has(client.id)) {
+        this.authenticateAndSetupUser(client, user);
+      }
+
+      const createdMessage = await this.messageService.createMessage(user, {
+        messageThreadId,
+        content,
+      });
+
+      const fullMessage = await this.messageService.getMessageById(
+        user,
+        createdMessage.messageId,
+      );
+
+      const thread = await this.threadService.getThreadById(
+        user,
+        messageThreadId,
+      );
+      const threadWithParticipants = thread as typeof thread & {
+        participants: Array<{ userId: number }>;
+      };
+
+      const messagePayload = {
+        message: {
+          messageId: fullMessage.messageId,
+          messageThreadId: fullMessage.messageThreadId,
+          senderId: fullMessage.senderId,
+          content: fullMessage.content,
+          createdAt: fullMessage.createdAt.toISOString(),
+          updatedAt: fullMessage.updatedAt.toISOString(),
+          editedAt: fullMessage.editedAt?.toISOString(),
+          sender: {
+            userId: fullMessage.sender.userId,
+            firstName: fullMessage.sender.firstName,
+            lastName: fullMessage.sender.lastName,
+          },
+          readReceipts: fullMessage.readReceipts?.map((rr) => ({
+            messageReadReceiptId: rr.messageReadReceiptId,
+            messageId: rr.messageId,
+            userId: rr.userId,
+            readAt: rr.readAt.toISOString(),
+            user: rr.user
+              ? {
+                  userId: rr.user.userId,
+                  firstName: rr.user.firstName,
+                  lastName: rr.user.lastName,
+                }
+              : undefined,
+          })),
+        },
+      };
+
+      const participantUserIds = threadWithParticipants.participants.map(
+        (p) => p.userId,
+      );
+      this.broadcastToUsers('new_message', messagePayload, participantUserIds);
+      this.broadcastToThread(messageThreadId, 'new_message', messagePayload);
+      this.server.emit('thread_updated', { messageThreadId });
+
+      client.emit('message_sent', {
+        messageThreadId,
+        messageId: createdMessage.messageId,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Error sending message: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      client.emit('message_error', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+        messageThreadId,
+      });
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('update_message')
+  async handleUpdateMessage(
+    @MessageBody(
+      new WsZodValidationPipe(
+        updateMessageThreadMessageDtoSchema.extend({
+          messageId: z.number().int().positive(),
+        }),
+      ),
+    )
+    data: UpdateMessageThreadMessageDto & { messageId: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { messageId, content } = data;
+
+    try {
+      const user = client.data.user as AuthUser;
+
+      if (!user) {
+        client.emit('message_error', {
+          error: 'Unauthorized: User not authenticated',
+        });
+        return;
+      }
+
+      if (!this.userSockets.get(user.userId)?.has(client.id)) {
+        this.authenticateAndSetupUser(client, user);
+      }
+
+      const message = await this.messageService.updateMessage(user, messageId, {
+        content,
+      });
+
+      const fullMessage = await this.messageService.getMessageById(
+        user,
+        message.messageId,
+      );
+
+      const thread = await this.threadService.getThreadById(
+        user,
+        message.messageThreadId,
+      );
+      const threadWithParticipants = thread as typeof thread & {
+        participants: Array<{ userId: number }>;
+      };
+
+      const messagePayload = {
+        message: {
+          messageId: fullMessage.messageId,
+          messageThreadId: fullMessage.messageThreadId,
+          senderId: fullMessage.senderId,
+          content: fullMessage.content,
+          createdAt: fullMessage.createdAt.toISOString(),
+          updatedAt: fullMessage.updatedAt.toISOString(),
+          editedAt: fullMessage.editedAt?.toISOString(),
+          sender: {
+            userId: fullMessage.sender.userId,
+            firstName: fullMessage.sender.firstName,
+            lastName: fullMessage.sender.lastName,
+          },
+          readReceipts: fullMessage.readReceipts?.map((rr) => ({
+            messageReadReceiptId: rr.messageReadReceiptId,
+            messageId: rr.messageId,
+            userId: rr.userId,
+            readAt: rr.readAt.toISOString(),
+            user: rr.user
+              ? {
+                  userId: rr.user.userId,
+                  firstName: rr.user.firstName,
+                  lastName: rr.user.lastName,
+                }
+              : undefined,
+          })),
+        },
+      };
+
+      const participantUserIds = threadWithParticipants.participants.map(
+        (p) => p.userId,
+      );
+      this.broadcastToUsers(
+        'message_updated',
+        messagePayload,
+        participantUserIds,
+      );
+      this.broadcastToThread(
+        message.messageThreadId,
+        'message_updated',
+        messagePayload,
+      );
+      this.server.emit('thread_updated', {
+        messageThreadId: message.messageThreadId,
+      });
+
+      client.emit('message_updated', {
+        messageId: message.messageId,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Error updating message: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      client.emit('message_error', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('mark_as_read')
+  async handleMarkAsRead(
+    @MessageBody(new WsZodValidationPipe(markMessagesAsReadDtoSchema))
+    data: MarkMessagesAsReadDto,
+    @ConnectedSocket() client: Socket,
+  ) {
+    const { messageThreadId, messageIds } = data;
+
+    try {
+      const user = client.data.user as AuthUser;
+
+      if (!user) {
+        client.emit('message_error', {
+          error: 'Unauthorized: User not authenticated',
+        });
+        return;
+      }
+
+      if (!this.userSockets.get(user.userId)?.has(client.id)) {
+        this.authenticateAndSetupUser(client, user);
+      }
+
+      await this.messageService.markMessagesAsRead(user, {
+        messageThreadId,
+        messageIds,
+      });
+
+      const thread = await this.threadService.getThreadById(
+        user,
+        messageThreadId,
+      );
+      const threadWithParticipants = thread as typeof thread & {
+        participants: Array<{ userId: number }>;
+      };
+
+      const readPayload = {
+        userId: user.userId,
+        messageThreadId,
+        messageIds: messageIds || [],
+      };
+
+      const participantUserIds = threadWithParticipants.participants.map(
+        (p) => p.userId,
+      );
+      this.broadcastToUsers('messages_read', readPayload, participantUserIds);
+      this.broadcastToThread(messageThreadId, 'messages_read', readPayload);
+      this.server.emit('thread_updated', { messageThreadId });
+
+      client.emit('marked_as_read', {
+        messageThreadId,
+      });
+    } catch (error) {
+      this.logger.error(
+        `Error marking messages as read: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      client.emit('message_error', {
+        error: error instanceof Error ? error.message : 'Unknown error',
+      });
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('join_thread')
+  async handleJoinThread(
+    @MessageBody(
+      new WsZodValidationPipe(
+        z.object({
+          messageThreadId: z.number().int().positive(),
+        }),
+      ),
+    )
+    data: { messageThreadId: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    const user = client.data.user as AuthUser;
+    if (!user) {
+      client.emit('error', { message: 'Not authenticated' });
+      return;
+    }
+
+    try {
+      if (!this.userSockets.get(user.userId)?.has(client.id)) {
+        this.authenticateAndSetupUser(client, user);
+      }
+
+      await this.threadService.getThreadById(user, data.messageThreadId);
+      client.join(`thread:${data.messageThreadId}`);
+      client.emit('joined_thread', { messageThreadId: data.messageThreadId });
+    } catch (error) {
+      this.logger.error(
+        `Error joining thread: ${error instanceof Error ? error.message : String(error)}`,
+        error instanceof Error ? error.stack : undefined,
+      );
+      client.emit('error', {
+        message:
+          error instanceof Error ? error.message : 'Failed to join thread',
+      });
+    }
+  }
+
+  @UseGuards(WsJwtAuthGuard)
+  @SubscribeMessage('leave_thread')
+  handleLeaveThread(
+    @MessageBody(
+      new WsZodValidationPipe(
+        z.object({
+          messageThreadId: z.number().int().positive(),
+        }),
+      ),
+    )
+    data: { messageThreadId: number },
+    @ConnectedSocket() client: Socket,
+  ) {
+    client.leave(`thread:${data.messageThreadId}`);
+    client.emit('left_thread', { messageThreadId: data.messageThreadId });
+  }
+
+  /**
+   * Broadcast to all clients in a thread room
+   */
+  private broadcastToThread(
+    messageThreadId: number,
+    event: string,
+    data: unknown,
+  ) {
+    this.server.to(`thread:${messageThreadId}`).emit(event, data);
+  }
+
+  /**
+   * Broadcast to specific users by their user IDs
+   * Uses tracked sockets directly for reliability, with room fallback
+   */
+  broadcastToUsers(event: string, data: unknown, userIds: number[]) {
+    for (const userId of userIds) {
+      const trackedSockets = this.userSockets.get(userId);
+      const socketIds = trackedSockets ? Array.from(trackedSockets) : [];
+
+      // Emit to each tracked socket directly
+      for (const socketId of socketIds) {
+        let socket: Socket | undefined;
+
+        if (this.server?.sockets?.sockets) {
+          socket = this.server.sockets.sockets.get(socketId);
+        } else if (
+          this.server?.sockets &&
+          typeof (
+            this.server.sockets as unknown as {
+              get: (socketId: string) => Socket;
+            }
+          ).get === 'function'
+        ) {
+          socket = (
+            this.server.sockets as unknown as {
+              get: (socketId: string) => Socket;
+            }
+          ).get(socketId);
+        }
+
+        if (socket && socket.connected) {
+          socket.emit(event, data);
+        } else {
+          trackedSockets?.delete(socketId);
+        }
+      }
+
+      // Also emit to room as fallback
+      this.server.to(`user:${userId}`).emit(event, data);
+    }
+  }
+}

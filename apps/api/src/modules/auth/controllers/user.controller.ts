@@ -1,0 +1,690 @@
+import { Response } from 'express';
+import { ZodValidationPipe } from 'nestjs-zod';
+import { z } from 'zod';
+
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Patch,
+  Post,
+  Put,
+  Query,
+  Res,
+  UseGuards,
+} from '@nestjs/common';
+import { AuthGuard } from '@nestjs/passport';
+import {
+  ApiBearerAuth,
+  ApiBody,
+  ApiOperation,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
+import { Throttle } from '@nestjs/throttler';
+
+import { Gender, UserLanguage, UserRole } from '@openathlete/database';
+import {
+  ACQUISITION_SOURCES,
+  CompleteOnboardingDto,
+  CreateAccountDto,
+  PasswordResetDto,
+  PasswordResetRequestDto,
+  SignupAttribution,
+  UpdateAccountDto,
+  completeOnboardingDtoSchema,
+  createAccountDtoSchema,
+  passwordResetRequestSchema,
+  passwordResetSchema,
+  signupAttributionSchema,
+  updateAccountDtoSchema,
+} from '@openathlete/shared';
+import {
+  AnalyticsConsentDto,
+  analyticsConsentDtoSchema,
+} from '@openathlete/shared';
+
+import { Language } from 'src/common/constants/languages.constant';
+import { RATE_LIMITS } from 'src/common/security/rate-limits';
+
+import { JwtUser } from '../decorators';
+import { AuthUser } from '../decorators/user.decorator';
+import { UserTypeGuard } from '../guards';
+import { UserService } from '../services';
+import { AccountExportService } from '../services/account-export.service';
+
+@ApiTags('User')
+@Controller('user')
+export class UserController {
+  constructor(
+    private userService: UserService,
+    private readonly accountExportService: AccountExportService,
+  ) {}
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Put('me/analytics-consent')
+  @ApiOperation({ summary: 'Record the choice made in the consent banner' })
+  @ApiResponse({ status: 200, description: 'Choice recorded' })
+  async setAnalyticsConsent(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(analyticsConsentDtoSchema))
+    { granted }: AnalyticsConsentDto,
+  ): Promise<void> {
+    await this.userService.setAnalyticsConsent(user.userId, granted);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Put('me/signup-attribution')
+  @HttpCode(204)
+  @ApiOperation({
+    summary: 'Record where a new user came from',
+    description:
+      'UTM parameters, referring site and website pages that led to the signup, carried by the links of the website. Recorded once, while the onboarding is not completed; later calls are ignored.',
+  })
+  @ApiResponse({ status: 204, description: 'Recorded, or already known' })
+  async recordSignupAttribution(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(signupAttributionSchema))
+    attribution: SignupAttribution,
+  ): Promise<void> {
+    await this.userService.recordSignupAttribution(user.userId, attribution);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Throttle(RATE_LIMITS.dataExport)
+  @Get('me/export')
+  @ApiOperation({
+    summary: 'Download all of the user’s data',
+    description:
+      'GDPR data portability: profile, athlete data (metrics, zones, equipment, injuries, plans, records), events with workouts and activities, templates, messages the user wrote, AI assistant conversations and AI settings, as one JSON file. Secrets (password hash, OAuth and push tokens, AI keys) are never included. Activity streams (GPS, heart rate...) are included with includeStreams=true.',
+  })
+  @ApiQuery({ name: 'includeStreams', required: false, type: Boolean })
+  @ApiResponse({ status: 200, description: 'JSON file download' })
+  async exportData(
+    @JwtUser() user: AuthUser,
+    @Query('includeStreams') includeStreams: string | undefined,
+    @Res() res: Response,
+  ) {
+    const date = new Date().toISOString().slice(0, 10);
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader(
+      'Content-Disposition',
+      `attachment; filename="openathlete-export-${date}.json"`,
+    );
+    await this.accountExportService.export(user.userId, res, {
+      includeStreams: includeStreams === 'true',
+    });
+  }
+
+  @Throttle(RATE_LIMITS.signup)
+  @Post()
+  @ApiOperation({
+    summary: 'Create a new user account',
+    description:
+      'Registers a new user account with email and password. Automatically creates an athlete profile with default 5-zone heart rate training zones (Recovery, Endurance, Tempo, Threshold, VO2 Max) for all sports. If invitation tokens are provided, they will be consumed to link the new account to existing coach/athlete relationships. Sends a welcome email to the new user and a signup notification to the admin.',
+  })
+  @ApiBody({
+    description: 'Account creation data',
+    schema: {
+      type: 'object',
+      properties: {
+        email: {
+          type: 'string',
+          format: 'email',
+          example: 'user@example.com',
+        },
+        password: {
+          type: 'string',
+          format: 'password',
+          example: 'securePassword123',
+        },
+        firstName: {
+          type: 'string',
+          example: 'John',
+        },
+        lastName: {
+          type: 'string',
+          example: 'Doe',
+        },
+        invitationToken: {
+          type: 'string',
+          description: 'Optional athlete invitation token to link to a coach',
+          example: 'abc123def456...',
+        },
+        coachInvitationToken: {
+          type: 'string',
+          description: 'Optional coach invitation token to link to an athlete',
+          example: 'xyz789uvw012...',
+        },
+        clubJoinToken: {
+          type: 'string',
+          description:
+            'Optional club link or invitation token: lets the account be created on an invite-only instance, the club is joined once signed in',
+        },
+        language: {
+          type: 'string',
+          enum: Object.values(UserLanguage),
+          description:
+            'Optional language of the app at sign-up, saved as the preferred language (default FR)',
+          example: 'EN',
+        },
+      },
+      required: ['email', 'password', 'firstName', 'lastName'],
+    },
+  })
+  @ApiResponse({
+    status: 201,
+    description: 'Account created successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        userId: {
+          type: 'number',
+          example: 1,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - failed to hash password',
+  })
+  @ApiResponse({
+    status: 409,
+    description: 'Conflict - user with this email already exists',
+  })
+  createAcount(
+    @Body(new ZodValidationPipe(createAccountDtoSchema)) body: CreateAccountDto,
+  ) {
+    return this.userService.createAccount(body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch()
+  @ApiOperation({
+    summary: 'Update user account information',
+    description:
+      "Updates the authenticated user's personal information (first name, last name, gender), the device's time zone and whether to get training reminders. Only the provided fields will be updated.",
+  })
+  @ApiBody({
+    description: 'Account update data',
+    schema: {
+      type: 'object',
+      properties: {
+        firstName: {
+          type: 'string',
+          example: 'Jane',
+        },
+        lastName: {
+          type: 'string',
+          example: 'Smith',
+        },
+        gender: {
+          type: 'string',
+          enum: Object.values(Gender),
+          example: 'FEMALE',
+        },
+        timeZone: {
+          type: 'string',
+          description:
+            'IANA time zone of the device, for reminders at local time',
+          example: 'Europe/Paris',
+        },
+        trainingReminders: {
+          type: 'boolean',
+          description:
+            'Push notification the evening before planned training sessions',
+        },
+        emailTips: {
+          type: 'boolean',
+          description: 'Onboarding tips and alerts about the account, by email',
+        },
+        emailRecap: {
+          type: 'boolean',
+          description: 'Monthly recap of the training, by email',
+        },
+        emailNews: {
+          type: 'boolean',
+          description:
+            'News about the project, Supporter included; true records the consent with its date',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Account updated successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        firstName: {
+          type: 'string',
+          example: 'Jane',
+        },
+        lastName: {
+          type: 'string',
+          example: 'Smith',
+        },
+        gender: {
+          type: 'string',
+          enum: Object.values(Gender),
+          example: 'FEMALE',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  updateAccount(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(updateAccountDtoSchema)) body: UpdateAccountDto,
+  ) {
+    return this.userService.updateAccount(user, body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Get('me')
+  @ApiOperation({
+    summary: 'Get current user information',
+    description:
+      "Retrieves the authenticated user's profile information including user ID, email, name, gender, roles, onboarding status, and preferred language.",
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'User information retrieved successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        userId: {
+          type: 'number',
+          example: 1,
+        },
+        email: {
+          type: 'string',
+          format: 'email',
+          example: 'user@example.com',
+        },
+        firstName: {
+          type: 'string',
+          example: 'John',
+        },
+        lastName: {
+          type: 'string',
+          example: 'Doe',
+        },
+        gender: {
+          type: 'string',
+          enum: Object.values(Gender),
+          nullable: true,
+          example: 'MALE',
+        },
+        roles: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: Object.values(UserRole),
+          },
+          example: ['ATHLETE', 'COACH'],
+        },
+        onboardingCompleted: {
+          type: 'boolean',
+          example: true,
+        },
+        language: {
+          type: 'string',
+          enum: Object.values(UserLanguage),
+          example: 'EN',
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  getMe(@JwtUser() user: AuthUser) {
+    return this.userService.getMe(user);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch('language')
+  @ApiOperation({
+    summary: 'Update user preferred language',
+    description:
+      "Updates the authenticated user's preferred language for the application interface. Supported languages are French (FR), English (EN), Italian (IT), Spanish (ES), Brazilian Portuguese (PT_BR), and German (DE).",
+  })
+  @ApiBody({
+    description: 'Language preference',
+    schema: {
+      type: 'object',
+      properties: {
+        language: {
+          type: 'string',
+          enum: Object.values(UserLanguage),
+          example: 'FR',
+        },
+      },
+      required: ['language'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Language updated successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  updateLanguage(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(z.object({ language: z.nativeEnum(Language) })))
+    body: { language: Language },
+  ) {
+    return this.userService.updateLanguage(user, body.language);
+  }
+
+  @Throttle(RATE_LIMITS.passwordReset)
+  @Post('password-reset/request')
+  @ApiOperation({
+    summary: 'Request password reset',
+    description:
+      "Initiates a password reset process by sending a reset token to the user's email address. The token is valid for a limited time and will be sent via email with a link to reset the password. If the email is not found in the system, the request is silently ignored for security reasons.",
+  })
+  @ApiBody({
+    description: 'Password reset request',
+    schema: {
+      type: 'object',
+      properties: {
+        email: {
+          type: 'string',
+          format: 'email',
+          example: 'user@example.com',
+        },
+      },
+      required: ['email'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Password reset email sent (or silently ignored if email not found)',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - email not found in system',
+  })
+  passwordResetRequest(
+    @Body(new ZodValidationPipe(passwordResetRequestSchema))
+    body: PasswordResetRequestDto,
+  ) {
+    return this.userService.passwordResetRequest(body);
+  }
+
+  @Throttle(RATE_LIMITS.passwordReset)
+  @Post('password-reset')
+  @ApiOperation({
+    summary: 'Reset password with token',
+    description:
+      "Resets the user's password using a valid password reset token received via email. The token must be valid and not expired. After successful reset, the old password is invalidated.",
+  })
+  @ApiBody({
+    description: 'Password reset data',
+    schema: {
+      type: 'object',
+      properties: {
+        token: {
+          type: 'string',
+          description: 'Password reset token received via email',
+          example: 'abc123def456...',
+        },
+        password: {
+          type: 'string',
+          format: 'password',
+          description: 'New password',
+          example: 'newSecurePassword123',
+        },
+      },
+      required: ['token', 'password'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Password reset successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 400,
+    description: 'Bad request - failed to hash password',
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or expired reset token',
+  })
+  passwordReset(
+    @Body(new ZodValidationPipe(passwordResetSchema)) body: PasswordResetDto,
+  ) {
+    return this.userService.passwordReset(body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Post('complete-onboarding')
+  @ApiOperation({
+    summary: 'Complete user onboarding',
+    description:
+      "Completes the user onboarding process by setting up user profile, metrics, and relationships. Updates user gender and marks onboarding as completed. Creates athlete metrics (weight, height, HR max, HR rest) if provided. If the user is an ATHLETE and provides a coachEmail, sends a coach invitation. If the user is a COACH and provides athleteEmails, sends athlete invitations. All metrics are stored with today's date and upserted to avoid duplicates.",
+  })
+  @ApiBody({
+    description: 'Onboarding completion data',
+    schema: {
+      type: 'object',
+      properties: {
+        roles: {
+          type: 'array',
+          items: {
+            type: 'string',
+            enum: Object.values(UserRole),
+          },
+          description: 'User roles (at least one required)',
+          example: ['ATHLETE', 'COACH'],
+          minItems: 1,
+        },
+        gender: {
+          type: 'string',
+          enum: Object.values(Gender),
+          example: 'MALE',
+        },
+        weight: {
+          type: 'number',
+          description: 'Weight in kilograms',
+          example: 70.5,
+          minimum: 0,
+        },
+        height: {
+          type: 'number',
+          description: 'Height in centimeters',
+          example: 175,
+          minimum: 0,
+        },
+        hrMax: {
+          type: 'integer',
+          description: 'Maximum heart rate in bpm',
+          example: 190,
+          minimum: 1,
+        },
+        hrRest: {
+          type: 'integer',
+          description: 'Resting heart rate in bpm',
+          example: 55,
+          minimum: 1,
+        },
+        coachEmail: {
+          type: 'string',
+          format: 'email',
+          description:
+            'Coach email to invite (only used if roles includes ATHLETE)',
+          example: 'coach@example.com',
+        },
+        athleteEmails: {
+          type: 'array',
+          items: {
+            type: 'string',
+            format: 'email',
+          },
+          description:
+            'Athlete emails to invite (only used if roles includes COACH)',
+          example: ['athlete1@example.com', 'athlete2@example.com'],
+        },
+        acquisitionSource: {
+          type: 'string',
+          enum: [...ACQUISITION_SOURCES],
+          description: 'How the user heard of OpenAthlete',
+          example: 'REDDIT',
+        },
+      },
+      required: ['roles'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Onboarding completed successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Not found - athlete record not found for user',
+  })
+  completeOnboarding(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(completeOnboardingDtoSchema))
+    body: CompleteOnboardingDto,
+  ) {
+    return this.userService.completeOnboarding(user, body);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Patch('push-token')
+  @ApiOperation({
+    summary: 'Update push notification token',
+    description:
+      "Updates the authenticated user's push notification token for receiving mobile push notifications. The token is only updated if it differs from the current stored token. This is typically called when the app starts or when the push token changes.",
+  })
+  @ApiBody({
+    description: 'Push token data',
+    schema: {
+      type: 'object',
+      properties: {
+        pushToken: {
+          type: 'string',
+          description: 'Push notification token from the device',
+          example: 'ExponentPushToken[xxxxxxxxxxxxxxxxxxxxxx]',
+          minLength: 1,
+        },
+      },
+      required: ['pushToken'],
+    },
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Push token updated successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  updatePushToken(
+    @JwtUser() user: AuthUser,
+    @Body(new ZodValidationPipe(z.object({ pushToken: z.string().min(1) })))
+    body: { pushToken: string },
+  ) {
+    return this.userService.updatePushToken(user, body.pushToken);
+  }
+
+  @UseGuards(AuthGuard('jwt'), UserTypeGuard)
+  @ApiBearerAuth()
+  @Delete()
+  @ApiOperation({
+    summary: 'Delete user account',
+    description:
+      "Permanently deletes the authenticated user's account and all associated data including athlete profile, events, training data, messages, and relationships. This operation cannot be undone.",
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Account deleted successfully',
+    schema: {
+      type: 'object',
+      properties: {
+        success: {
+          type: 'boolean',
+          example: true,
+        },
+      },
+    },
+  })
+  @ApiResponse({
+    status: 401,
+    description: 'Unauthorized - invalid or missing authentication token',
+  })
+  deleteAccount(@JwtUser() user: AuthUser) {
+    return this.userService.deleteAccount(user);
+  }
+}

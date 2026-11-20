@@ -1,0 +1,759 @@
+import * as argon2 from 'argon2';
+
+import {
+  BadRequestException,
+  ConflictException,
+  ForbiddenException,
+  Injectable,
+  Logger,
+  NotFoundException,
+  Optional,
+  UnauthorizedException,
+} from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+
+import {
+  Gender,
+  MetricType,
+  Prisma,
+  SportType,
+  TokenType,
+  UserRole,
+} from '@openathlete/database';
+import {
+  ApiEnvSchemaType,
+  CompleteOnboardingDto,
+  CreateAccountDto,
+  PasswordResetDto,
+  PasswordResetRequestDto,
+  SignupAttribution,
+  TARGET_RACE_PRESETS,
+  TargetRaceDto,
+  UpdateAccountDto,
+} from '@openathlete/shared';
+
+import { Language } from 'src/common/constants/languages.constant';
+import { maskEmail } from 'src/common/utils/mask-email';
+import { zonedInstant } from 'src/common/utils/time-zone';
+import { HeartRateProfileChangedEvent, SendEmailEvent } from 'src/events';
+import {
+  AnalyticsService,
+  stableUuid,
+} from 'src/modules/analytics/analytics.service';
+import { opensAClub } from 'src/modules/club/club-join-token';
+import { emailTransportKind } from 'src/modules/notification/services/email-transport.service';
+import {
+  PrismaService,
+  UserRow,
+} from 'src/modules/prisma/services/prisma.service';
+
+import { AuthUser } from '../decorators/user.decorator';
+import { passwordResetUrl } from '../helpers/password-reset-url';
+import { AccountDeletionService } from './account-deletion.service';
+import { AthleteInvitationService } from './athlete-invitation.service';
+import { CoachInvitationService } from './coach-invitation.service';
+import { TokenService } from './token.service';
+
+const NEW_ACCOUNT_MS = 24 * 60 * 60 * 1000;
+
+@Injectable()
+export class UserService {
+  private readonly logger = new Logger();
+  HASH_PEPPER: Buffer | undefined;
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly configService: ConfigService<ApiEnvSchemaType, true>,
+    private eventEmitter: EventEmitter2,
+    private tokenService: TokenService,
+    private invitationService: AthleteInvitationService,
+    private coachInvitationService: CoachInvitationService,
+    private readonly accountDeletionService: AccountDeletionService,
+    @Optional() private readonly analytics?: AnalyticsService,
+  ) {
+    this.HASH_PEPPER = this.configService.get('HASH_PEPPER')
+      ? Buffer.from(this.configService.get('HASH_PEPPER'))
+      : undefined;
+  }
+
+  /**
+   * The browser sends the banner's choice, which server-side events follow.
+   * Signing up precedes it, so a new account is reported here: this covers
+   * every way of signing up, dated from the account.
+   */
+  async setAnalyticsConsent(userId: number, granted: boolean): Promise<void> {
+    const before = await this.prisma.user.findUniqueOrThrow({
+      where: { userId },
+      select: { analyticsConsentAt: true, createdAt: true },
+    });
+    if (Boolean(before.analyticsConsentAt) === granted) return;
+
+    await this.prisma.user.update({
+      where: { userId },
+      data: { analyticsConsentAt: granted ? new Date() : null },
+    });
+    if (granted && Date.now() - before.createdAt.getTime() < NEW_ACCOUNT_MS) {
+      this.analytics?.send(
+        userId,
+        'account_created',
+        {},
+        {
+          timestamp: before.createdAt,
+          uuid: stableUuid(`account_created:${userId}`),
+        },
+      );
+    }
+  }
+
+  /**
+   * Records where a new user came from. Only once, before the onboarding is
+   * done: a later visit with other campaign parameters keeps the first one.
+   */
+  async recordSignupAttribution(
+    userId: number,
+    attribution: SignupAttribution,
+  ): Promise<void> {
+    if (Object.keys(attribution).length === 0) return;
+    await this.prisma.user.updateMany({
+      where: {
+        userId,
+        onboardingCompleted: false,
+        signupAttribution: { equals: Prisma.DbNull },
+      },
+      data: { signupAttribution: attribution },
+    });
+  }
+
+  async findOneOrFail(where: Prisma.UserWhereInput): Promise<UserRow> {
+    return this.prisma.user.findFirstOrThrow({ where });
+  }
+
+  async findOne(where: Prisma.UserWhereInput): Promise<UserRow | null> {
+    return this.prisma.user.findFirst({ where });
+  }
+
+  async exists(where: Prisma.UserWhereInput): Promise<boolean> {
+    return this.prisma.user.findFirst({ where }).then((user) => !!user);
+  }
+
+  public hashPassword = async (plainPassword: string) =>
+    await argon2.hash(plainPassword, {
+      secret: this.HASH_PEPPER,
+    });
+
+  public getMe = async (user: AuthUser) => {
+    return await this.prisma.user.findUniqueOrThrow({
+      where: { userId: user.userId },
+      select: {
+        userId: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        gender: true,
+        roles: true,
+        onboardingCompleted: true,
+        language: true,
+        timeZone: true,
+        trainingReminders: true,
+        calendarDisplay: true,
+        coachDashboard: true,
+        hiddenActivityTracks: true,
+        supportReminderDismissedAt: true,
+        supportReminderDismissCount: true,
+        supporterNudgeSeenAt: true,
+        emailTips: true,
+        emailRecap: true,
+        emailNewsConsentAt: true,
+        acquisitionSource: true,
+        practicedSports: true,
+        trainingGoal: true,
+        weeklyTrainingHours: true,
+        coachTeamSize: true,
+        createdAt: true,
+      },
+    });
+  };
+
+  public updateLanguage = async (user: AuthUser, language: Language) => {
+    await this.prisma.user.update({
+      where: { userId: user.userId },
+      data: { language },
+    });
+    return { success: true };
+  };
+
+  public updatePushToken = async (user: AuthUser, pushToken: string) => {
+    const currentUser = await this.prisma.user.findUnique({
+      where: { userId: user.userId },
+      select: { pushToken: true },
+    });
+
+    if (currentUser?.pushToken !== pushToken) {
+      await this.prisma.user.update({
+        where: { userId: user.userId },
+        data: { pushToken: pushToken },
+      });
+      this.logger.log(`Updated push token for user ${user.userId}`);
+    }
+
+    return { success: true };
+  };
+
+  /**
+   * Applies SIGNUP_MODE to a new account, by password or by Google. The
+   * first account of an instance is always allowed: it is its
+   * administrator's.
+   */
+  private async assertSignupAllowed(
+    invitationToken?: string,
+    coachInvitationToken?: string,
+    clubJoinToken?: string,
+  ) {
+    const mode = this.configService.get('SIGNUP_MODE') ?? 'open';
+    if (mode === 'open') return;
+    if ((await this.prisma.user.count()) === 0) return;
+    if (mode === 'invite') {
+      const invited =
+        (invitationToken &&
+          (await this.invitationService.verifyInvitationToken(
+            invitationToken,
+          ))) ||
+        (coachInvitationToken &&
+          (await this.coachInvitationService.verifyInvitationToken(
+            coachInvitationToken,
+          ))) ||
+        // A club's link or personal invitation: the club is joined once
+        // signed in, as on an open instance
+        (clubJoinToken && (await opensAClub(this.prisma, clubJoinToken)));
+      if (invited) return;
+      throw new ForbiddenException('SIGNUP_INVITE_ONLY');
+    }
+    throw new ForbiddenException('SIGNUP_CLOSED');
+  }
+
+  /**
+   * An invitation link must be valid before an account is created with it,
+   * and a password sign-up must use the address it was sent to. Google and
+   * Apple set the address themselves (Apple may hide it behind a relay).
+   */
+  private async assertInvitationsUsable(
+    email: string,
+    tokens: { invitationToken?: string; coachInvitationToken?: string },
+    emailFromProvider: boolean,
+  ) {
+    const invitations = await Promise.all([
+      tokens.invitationToken &&
+        this.invitationService.verifyInvitationToken(tokens.invitationToken),
+      tokens.coachInvitationToken &&
+        this.coachInvitationService.verifyInvitationToken(
+          tokens.coachInvitationToken,
+        ),
+    ]);
+    for (const [index, token] of [
+      tokens.invitationToken,
+      tokens.coachInvitationToken,
+    ].entries()) {
+      if (!token) continue;
+      const invitation = invitations[index];
+      if (!invitation) {
+        throw new BadRequestException('Invalid or expired invitation token');
+      }
+      if (!emailFromProvider && invitation.email.toLowerCase() !== email) {
+        throw new BadRequestException('INVITATION_EMAIL_MISMATCH');
+      }
+    }
+  }
+
+  public createAccount = async (
+    {
+      email,
+      password,
+      firstName,
+      lastName,
+      invitationToken,
+      coachInvitationToken,
+      clubJoinToken,
+      language,
+      emailNews,
+    }: CreateAccountDto,
+    { emailFromProvider = false }: { emailFromProvider?: boolean } = {},
+  ) => {
+    await this.assertSignupAllowed(
+      invitationToken,
+      coachInvitationToken,
+      clubJoinToken,
+    );
+    const normalizedEmail = email.toLowerCase();
+    await this.assertInvitationsUsable(
+      normalizedEmail,
+      { invitationToken, coachInvitationToken },
+      emailFromProvider,
+    );
+    const hashedPassword = await this.hashPassword(password);
+
+    if (!hashedPassword) {
+      throw new BadRequestException('Failed to hash password');
+    }
+
+    const userExists = await this.exists({ email: normalizedEmail });
+
+    if (userExists) {
+      throw new ConflictException('User already exists');
+    }
+
+    // Default 5-zone heart rate system for new athletes
+    // Colors chosen to be coherent and compatible with color inputs (hex)
+    const DEFAULT_HR_ZONES = [
+      {
+        name: 'Zone 1',
+        description: 'Recovery',
+        min: 0,
+        max: 131,
+        color: '#9CA3AF', // gray-400
+      },
+      {
+        name: 'Zone 2',
+        description: 'Endurance',
+        min: 132,
+        max: 142,
+        color: '#22C55E', // green-500
+      },
+      {
+        name: 'Zone 3',
+        description: 'Tempo',
+        min: 143,
+        max: 152,
+        color: '#EAB308', // yellow-500
+      },
+      {
+        name: 'Zone 4',
+        description: 'Threshold',
+        min: 153,
+        max: 163,
+        color: '#F97316', // orange-500
+      },
+      {
+        name: 'Zone 5',
+        description: 'VO2 Max',
+        min: 164,
+        max: 220,
+        color: '#EF4444', // red-500
+      },
+    ];
+
+    const allSports = Object.values(SportType) as SportType[];
+
+    const created = await this.prisma.user
+      .create({
+        data: {
+          email: normalizedEmail,
+          password: hashedPassword,
+          firstName: firstName,
+          lastName: lastName,
+          // The language the app was shown in; absent, the column's default
+          language,
+          // Ticked by the person on the form, never by default
+          emailNewsConsentAt: emailNews ? new Date() : null,
+          roles: [UserRole.ATHLETE, UserRole.COACH],
+          athlete: {
+            create: {
+              trainingZones: {
+                create: DEFAULT_HR_ZONES.map((z, idx) => ({
+                  name: z.name,
+                  description: z.description,
+                  index: idx,
+                  type: 'HEARTRATE',
+                  color: z.color,
+                  values: {
+                    create: [
+                      {
+                        min: z.min,
+                        max: z.max,
+                        sports: allSports,
+                      },
+                    ],
+                  },
+                })),
+              },
+            },
+          },
+        },
+        select: {
+          userId: true,
+        },
+      })
+      .catch((error: unknown) => {
+        // Two sign-ups for the same email at once (double submit, OAuth
+        // callbacks) both pass the check above; the database decides
+        if (
+          error instanceof Prisma.PrismaClientKnownRequestError &&
+          error.code === 'P2002'
+        ) {
+          throw new ConflictException('User already exists');
+        }
+        throw error;
+      });
+
+    if (invitationToken) {
+      await this.invitationService.consumeInvitation(
+        invitationToken,
+        created.userId,
+      );
+    }
+
+    if (coachInvitationToken) {
+      await this.coachInvitationService.consumeInvitation(
+        coachInvitationToken,
+        created.userId,
+      );
+    }
+
+    this.eventEmitter.emit(
+      SendEmailEvent.SLUG,
+      new SendEmailEvent({
+        type: 'welcome',
+        to: normalizedEmail,
+        params: {
+          name: firstName,
+          connections_url: `${this.configService.get('APP_URL')}/dashboard/settings?tab=connectors`,
+          signature: this.configService.get('EMAIL_SIGNATURE') || undefined,
+        },
+        language,
+      }),
+    );
+
+    // Opt-in: a self-hosted instance must not tell anyone about its users
+    const notificationEmail = this.configService.get(
+      'SIGNUP_NOTIFICATION_EMAIL',
+    );
+    if (notificationEmail) {
+      this.eventEmitter.emit(
+        SendEmailEvent.SLUG,
+        new SendEmailEvent({
+          type: 'signup-notification',
+          to: notificationEmail,
+          params: {
+            email: normalizedEmail,
+            firstName,
+            lastName,
+          },
+        }),
+      );
+    }
+
+    return created;
+  };
+
+  public updateAccount = async (user: AuthUser, data: UpdateAccountDto) => {
+    return await this.prisma.user.update({
+      where: { userId: user.userId },
+      data: {
+        firstName: data.firstName,
+        lastName: data.lastName,
+        gender: data.gender,
+        timeZone: data.timeZone,
+        trainingReminders: data.trainingReminders,
+        calendarDisplay: data.calendarDisplay,
+        coachDashboard: data.coachDashboard,
+        hiddenActivityTracks: data.hiddenActivityTracks,
+        supportReminderDismissedAt: data.supportReminderDismissed
+          ? new Date()
+          : undefined,
+        supportReminderDismissCount: data.supportReminderDismissed
+          ? { increment: 1 }
+          : undefined,
+        supporterNudgeSeenAt: data.supporterNudgeSeen ? new Date() : undefined,
+        emailTips: data.emailTips,
+        emailRecap: data.emailRecap,
+        practicedSports: data.practicedSports as SportType[] | undefined,
+        trainingGoal: data.trainingGoal,
+        weeklyTrainingHours: data.weeklyTrainingHours,
+        coachTeamSize: data.coachTeamSize,
+        emailNewsConsentAt:
+          data.emailNews === undefined
+            ? undefined
+            : data.emailNews
+              ? new Date()
+              : null,
+      },
+      select: {
+        firstName: true,
+        lastName: true,
+        gender: true,
+        timeZone: true,
+        trainingReminders: true,
+        calendarDisplay: true,
+        coachDashboard: true,
+        hiddenActivityTracks: true,
+        supportReminderDismissedAt: true,
+        supportReminderDismissCount: true,
+        supporterNudgeSeenAt: true,
+        emailTips: true,
+        emailRecap: true,
+        emailNewsConsentAt: true,
+        practicedSports: true,
+        trainingGoal: true,
+        weeklyTrainingHours: true,
+        coachTeamSize: true,
+      },
+    });
+  };
+
+  async comparePasswords(
+    params: { pass_string: string; pass_hash: string },
+    options?: { email?: string },
+  ) {
+    const { pass_string, pass_hash } = params || {};
+    const { email } = options || {};
+
+    const areCredentialsValid = await argon2.verify(pass_hash, pass_string, {
+      secret: this.HASH_PEPPER,
+    });
+    if (!areCredentialsValid) {
+      this.logger.log(
+        `Invalid credentials for user${email ? ` ${maskEmail(email)}` : ''}`,
+      );
+      throw new UnauthorizedException();
+    }
+
+    return areCredentialsValid;
+  }
+
+  public passwordResetRequest = async (body: PasswordResetRequestDto) => {
+    const user = await this.findOne({ email: body.email });
+    if (!user) {
+      // Answer exactly as for an existing account so this endpoint cannot
+      // be used to find out which emails are registered
+      this.logger.log(
+        `Password reset requested for unknown email ${maskEmail(body.email)}`,
+      );
+      return;
+    }
+
+    const token = await this.tokenService.createToken(
+      { userId: user.userId },
+      TokenType.PASSWORD_RESET,
+    );
+    const url = passwordResetUrl(
+      this.configService.get('APP_URL'),
+      token.token,
+    );
+
+    if (!emailTransportKind((key) => this.configService.get(key))) {
+      // Nothing can carry the link to the user: the instance administrator
+      // reads it here and passes it on
+      this.logger.warn(
+        `Email is not configured. Password reset link for ${maskEmail(body.email)}, valid 15 minutes: ${url}`,
+      );
+      return;
+    }
+
+    this.eventEmitter.emit(
+      SendEmailEvent.SLUG,
+      new SendEmailEvent({
+        type: 'password-reset',
+        to: body.email,
+        params: { url },
+      }),
+    );
+  };
+
+  public passwordReset = async (body: PasswordResetDto) => {
+    // A reset link works once
+    const user = await this.tokenService.consumeToken(
+      body.token,
+      TokenType.PASSWORD_RESET,
+    );
+
+    if (!user) {
+      this.logger.log('Password reset token not found, expired or used');
+      throw new UnauthorizedException();
+    }
+
+    const hashedPassword = await this.hashPassword(body.password);
+
+    if (!hashedPassword) {
+      throw new BadRequestException('Failed to hash password');
+    }
+
+    await this.prisma.user.update({
+      where: { userId: user.userId },
+      data: { password: hashedPassword },
+    });
+  };
+
+  public completeOnboarding = async (
+    user: AuthUser,
+    data: CompleteOnboardingDto,
+  ) => {
+    // Metrics are stored by day, in UTC
+    const now = new Date();
+    const today = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
+    );
+
+    const updated = await this.prisma.user.update({
+      where: { userId: user.userId },
+      data: {
+        gender: data.gender as Gender | undefined,
+        acquisitionSource: data.acquisitionSource,
+        practicedSports: data.practicedSports as SportType[] | undefined,
+        trainingGoal: data.trainingGoal,
+        weeklyTrainingHours: data.weeklyTrainingHours,
+        coachTeamSize: data.coachTeamSize,
+        onboardingCompleted: true,
+      },
+      select: { timeZone: true },
+    });
+
+    // Get athlete record
+    const athlete = await this.prisma.athlete.findUnique({
+      where: { userId: user.userId },
+    });
+
+    if (!athlete) {
+      throw new NotFoundException('Athlete record not found');
+    }
+
+    // Create metrics if provided
+    const metricsToCreate: Array<{
+      type: MetricType;
+      date: Date;
+      value: number;
+    }> = [];
+
+    if (data.weight) {
+      metricsToCreate.push({
+        type: 'WEIGHT',
+        date: today,
+        value: data.weight,
+      });
+    }
+
+    if (data.height) {
+      metricsToCreate.push({
+        type: 'HEIGHT',
+        date: today,
+        value: data.height,
+      });
+    }
+
+    if (data.hrMax) {
+      metricsToCreate.push({
+        type: 'HR_MAX',
+        date: today,
+        value: data.hrMax,
+      });
+    }
+
+    if (data.hrRest) {
+      metricsToCreate.push({
+        type: 'HR_REST',
+        date: today,
+        value: data.hrRest,
+      });
+    }
+
+    // Create metrics (upsert to avoid duplicates)
+    for (const metric of metricsToCreate) {
+      await this.prisma.athleteMetric.upsert({
+        where: {
+          athleteId_type_date: {
+            athleteId: athlete.athleteId,
+            type: metric.type,
+            date: metric.date,
+          },
+        },
+        create: {
+          athleteId: athlete.athleteId,
+          type: metric.type,
+          date: metric.date,
+          value: metric.value,
+        },
+        update: {
+          value: metric.value,
+          source: null,
+        },
+      });
+    }
+    // A watch connected before onboarding may already have brought activities
+    if (data.hrMax || data.hrRest) {
+      this.eventEmitter.emit(
+        HeartRateProfileChangedEvent.SLUG,
+        new HeartRateProfileChangedEvent({ athleteId: athlete.athleteId }),
+      );
+    }
+
+    if (data.targetRace && data.roles.includes('ATHLETE')) {
+      await this.createTargetRace(
+        athlete.athleteId,
+        data.targetRace,
+        updated.timeZone ?? 'UTC',
+      );
+    }
+
+    // Invite coach if provided
+    if (data.coachEmail && data.roles.includes('ATHLETE')) {
+      await this.coachInvitationService.createInvitation(
+        user.userId,
+        data.coachEmail,
+      );
+    }
+
+    // Invite athletes if provided
+    if (
+      data.athleteEmails &&
+      data.athleteEmails.length > 0 &&
+      data.roles.includes('COACH')
+    ) {
+      for (const email of data.athleteEmails) {
+        try {
+          await this.invitationService.createInvitation(user.userId, email);
+        } catch (error) {
+          // Log but don't fail the entire onboarding if one invitation fails
+          this.logger.warn(
+            `Failed to invite athlete ${maskEmail(email)}: ${error}`,
+          );
+        }
+      }
+    }
+
+    return { success: true };
+  };
+
+  /**
+   * The race the athlete prepares, told during onboarding: it starts the
+   * calendar with a goal. Races have no time, so noon keeps it on the right
+   * day whatever the time zone.
+   */
+  private async createTargetRace(
+    athleteId: number,
+    race: TargetRaceDto,
+    timeZone: string,
+  ) {
+    const preset = TARGET_RACE_PRESETS[race.distance];
+    const startDate = zonedInstant(race.date, '12:00', timeZone);
+    await this.prisma.event.create({
+      data: {
+        athleteId,
+        type: 'COMPETITION',
+        name: race.name ?? preset.name,
+        startDate,
+        endDate: new Date(startDate.getTime() + 60 * 60 * 1000),
+        competition: {
+          create: {
+            sport: preset.sport as SportType,
+            goalDistance: preset.distance,
+            priority: 'A',
+          },
+        },
+      },
+    });
+  }
+
+  public deleteAccount = async (user: AuthUser) => {
+    await this.accountDeletionService.deleteAccount(user.userId);
+    return { success: true };
+  };
+}

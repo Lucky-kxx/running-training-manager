@@ -1,0 +1,37 @@
+# Web app (React + Vite)
+
+The same build ships to Vercel (hosted), to the Docker image (self-hosted) and to the Capacitor iOS and Android apps.
+
+## Layout
+
+- `src/api/<domain>/`: one folder per API domain.
+  - `<domain>.api.ts`: static methods calling `client` and `routes` from `@/utils/axios`, typed with `@openathlete/shared` DTOs;
+  - `<domain>.keys.ts`: stable React Query keys;
+  - `<domain>.hooks.ts`: `useXQuery` and `useXMutation`. Mutations invalidate the queries they affect.
+- `src/pages/`: route entry points. `src/views/`: page bodies. `src/components/`: reusable pieces, with shadcn/ui primitives in `components/ui/`.
+- `src/routes/`: route tree (`sections/*.routes.tsx`). Build URLs with `getPath([...])` from `routes/paths.ts`.
+- `src/contexts/`: auth (tokens in `localStorage`), current space (athlete or coach), chatbot.
+- `messages/{en,fr,it,es,pt-BR,de}.json`: Paraglide catalogs. `src/paraglide/` is generated.
+
+## Rules
+
+- **Text**: every user-visible string is `m.some_key()` from `@/paraglide/messages`. Add the key to all six catalogs, then run `pnpm check:locale-parity` at the root (see the `i18n` skill).
+- **Design**: colours, fonts and radii are variables in `src/theme/index.css`; never hardcode a hex or a gray utility. Use `PageTitle`, `SectionLabel`, `MetricTile` and `InsightBanner` from `components/ui` rather than restyling them in a view.
+- **Server state**: React Query hooks only. Don't copy query data into local state.
+- **Forms**: React Hook Form with a Zod schema, built from `libs/shared` when the API validates the same data, and the `RHF*` fields in `components/hook-form` (they show validation messages). Show API errors with `toast.error`.
+- **Small screens**: below 768px, in a browser as in the native apps, the dashboard is `AppShell` (`components/mobile`): tabs at the bottom (`app-navigation.ts`), a stack of screens, and sheets.
+  - A screen sets its top bar with `useAppBar` (title, trailing buttons, `fullHeight`, `hideTabBar`).
+  - `Dialog` opens as a bottom sheet, or full screen with `mobileFullscreen`; menus, selects and popovers become sheets in `theme/index.css`. Don't rebuild this per component.
+  - Pad fixed elements with `--safe-top`, `--safe-bottom` and `--tab-bar-space`, never `env()` directly.
+  - Check new pages at 390px: no horizontal scroll, touch targets of 44px.
+- **Settings pages**: build them from `settings-section.tsx` (`SettingsSection`, `SettingsPanel`, `SettingsRow`), the look of the Me tab, on every screen size. A section is never a `Card`, and a panel never holds another framed surface.
+- **Native apps**: guard native-only code with `isCapacitor()` from `@/utils/capacitor`. The Capacitor projects (`android/`, `ios/`) are built and published by fastlane (`fastlane/Fastfile`, `docs/mobile-releases.md`); never set a version in them, the release tag does. Build-time `VITE_*` values for the apps come from GitHub variables, since a native bundle cannot read them at runtime.
+- **Third parties**: nothing may load or send data unless its build variable is set. PostHog (analytics and error reports) and Contentsquare are opt-in (`utils/analytics.ts`, `utils/error-monitoring.ts`). The E2E test `makes no third-party request` enforces this.
+- **Consent (GDPR)**: analytics and session recordings start only through `whenConsentGranted` (`utils/consent.ts`), after the user accepts the banner. A new tracker goes through it too, and is listed in the website privacy policy.
+- **API URL**: read through `API_BASE_URL` (`src/config.ts`). Docker images inject it at runtime into a `<meta>` tag of `index.html` (`docker/40-api-public-url.sh`); never bake deployment values into the bundles.
+
+## Checks
+
+- `pnpm test`: Vitest unit tests (`*.test.ts`).
+- `pnpm lint` and `pnpm tsc:check`. Rebuild `libs/shared` first if it changed.
+- User flows: add or extend a Playwright test in `e2e/tests/web` or `e2e/tests/mobile` (see the `e2e` skill).

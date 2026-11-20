@@ -1,0 +1,86 @@
+import { AnalyticsEvent } from '@/utils/analytics-events';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import posthog from 'posthog-js';
+
+import { Event } from '@openathlete/shared';
+
+import { eventKeys } from '../event/event.keys';
+import { ActivityFeedbackAPI } from './activity-feedback.api';
+import { activityFeedbackKeys } from './activity-feedback.keys';
+
+export function useGetActivityFeedbackQuestionsQuery(
+  eventId: Event['eventId'],
+  enabled: boolean = true,
+) {
+  return useQuery({
+    queryKey: activityFeedbackKeys.getFeedbackQuestions(eventId),
+    queryFn: () => ActivityFeedbackAPI.getFeedbackQuestions(eventId),
+    enabled: !!eventId && enabled,
+  });
+}
+
+export function useSubmitQuestionAnswerMutation(eventId: Event['eventId']) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: ({
+      questionId,
+      answerText,
+    }: {
+      questionId: number;
+      answerText: string;
+    }) => ActivityFeedbackAPI.submitAnswer(eventId, questionId, answerText),
+    onSuccess: () => {
+      posthog.capture(AnalyticsEvent.activity_feedback_answered);
+      // Invalidate questions query to refresh answers
+      queryClient.invalidateQueries({
+        queryKey: activityFeedbackKeys.getFeedbackQuestions(eventId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getEvent, eventId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getMyEvents],
+      });
+    },
+  });
+}
+
+export function useSkipFeedbackMutation(eventId: Event['eventId']) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () => ActivityFeedbackAPI.skipFeedback(eventId),
+    onSuccess: () => {
+      posthog.capture(AnalyticsEvent.activity_feedback_skipped);
+      queryClient.invalidateQueries({
+        queryKey: activityFeedbackKeys.getFeedbackQuestions(eventId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getEvent, eventId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getMyEvents],
+      });
+    },
+  });
+}
+
+export function useUnskipFeedbackMutation(eventId: Event['eventId']) {
+  const queryClient = useQueryClient();
+
+  return useMutation({
+    mutationFn: () => ActivityFeedbackAPI.unskipFeedback(eventId),
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: activityFeedbackKeys.getFeedbackQuestions(eventId),
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getEvent, eventId],
+      });
+      queryClient.invalidateQueries({
+        queryKey: [eventKeys.getMyEvents],
+      });
+    },
+  });
+}

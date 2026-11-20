@@ -1,0 +1,8 @@
+---
+description: OpenAthlete conventions, commands and quality gates
+globs:
+  - "**/*"
+alwaysApply: true
+---
+
+Follow the project guide in @CLAUDE.md, and the area guides @apps/api/CLAUDE.md and @apps/web/CLAUDE.md when working in those apps. Step-by-step workflows (checks, migrations, translations, endpoints, E2E tests, PR reviews, releases) are in `.claude/skills/*/SKILL.md`.

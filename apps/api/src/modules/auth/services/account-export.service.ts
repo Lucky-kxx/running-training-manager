@@ -1,0 +1,470 @@
+import { Injectable, Logger } from '@nestjs/common';
+
+import { EVENT_INCLUDES } from 'src/modules/core/services/event-includes';
+import { PrismaService } from 'src/modules/prisma/services/prisma.service';
+
+/** Where the export is written: an HTTP response, or a buffer in tests. */
+export interface ExportSink {
+  write(chunk: string): unknown;
+  end(): unknown;
+}
+
+export const ACCOUNT_EXPORT_FORMAT = 'openathlete-export-v1';
+
+/** Events are read and written in batches so large accounts stream. */
+const EVENT_BATCH = 100;
+
+/**
+ * Everything a user can take with them (GDPR right to data portability), as
+ * one JSON document. Secrets are never part of it: password hash, provider
+ * and push tokens, AI keys. Columns of sensitive tables are listed one by
+ * one so that a new secret column cannot leak by default.
+ *
+ * Activity streams (GPS, heart rate...) are large: they are only included
+ * when asked for.
+ */
+@Injectable()
+export class AccountExportService {
+  private readonly logger = new Logger(AccountExportService.name);
+
+  constructor(private readonly prisma: PrismaService) {}
+
+  async export(
+    userId: number,
+    sink: ExportSink,
+    options: { includeStreams: boolean },
+  ): Promise<void> {
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: { userId },
+      select: {
+        email: true,
+        firstName: true,
+        lastName: true,
+        gender: true,
+        language: true,
+        timeZone: true,
+        trainingReminders: true,
+        emailTips: true,
+        emailRecap: true,
+        emailNewsConsentAt: true,
+        roles: true,
+        onboardingCompleted: true,
+        acquisitionSource: true,
+        signupAttribution: true,
+        createdAt: true,
+        subscription: {
+          select: {
+            plan: true,
+            status: true,
+            cancelAtPeriodEnd: true,
+            createdAt: true,
+          },
+        },
+        // The onboarding, recap and news emails sent, and when
+        lifecycleEmails: { select: { kind: true, ref: true, sentAt: true } },
+        athlete: { select: { athleteId: true } },
+      },
+    });
+    const athleteId = user.athlete?.athleteId;
+
+    const write = (key: string, value: unknown, last = false) =>
+      sink.write(
+        `${JSON.stringify(key)}:${JSON.stringify(value)}${last ? '' : ','}`,
+      );
+
+    sink.write('{');
+    write('format', ACCOUNT_EXPORT_FORMAT);
+    write('exportedAt', new Date().toISOString());
+    write('user', { ...user, athlete: undefined });
+    write('athlete', athleteId ? await this.athleteData(athleteId) : null);
+    write('coaching', await this.coaching(userId));
+    write('clubs', await this.clubs(userId, athleteId));
+    write('templates', await this.templates(userId));
+    write('messages', await this.messages(userId));
+    // Messages the user wrote to send later
+    write(
+      'scheduledMessages',
+      await this.prisma.scheduledMessage.findMany({
+        where: { senderId: userId },
+        select: {
+          content: true,
+          mode: true,
+          title: true,
+          sendAt: true,
+          status: true,
+          sentAt: true,
+          createdAt: true,
+        },
+        orderBy: { scheduledMessageId: 'asc' },
+      }),
+    );
+    write(
+      'activityAlertSettings',
+      await this.prisma.coachActivityAlertSettings.findMany({
+        where: { coachUserId: userId },
+        select: {
+          athleteId: true,
+          notifyComments: true,
+          notifyRpe: true,
+          notifyNewActivities: true,
+        },
+      }),
+    );
+    // Bounds the user watches, as a coach, on athletes' metrics
+    write(
+      'metricThresholds',
+      await this.prisma.coachMetricThreshold.findMany({
+        where: { coachUserId: userId },
+        select: { athleteId: true, metricType: true, min: true, max: true },
+        orderBy: { metricThresholdId: 'asc' },
+      }),
+    );
+    // The user's private notes as a coach, whoever they are about
+    write(
+      'coachNotes',
+      await this.prisma.coachNote.findMany({
+        where: { coachUserId: userId },
+        select: {
+          title: true,
+          content: true,
+          pinned: true,
+          athleteId: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        orderBy: { coachNoteId: 'asc' },
+      }),
+    );
+    write(
+      'coachNotebook',
+      await this.prisma.coachNotebook.findUnique({
+        where: { coachUserId: userId },
+        select: { content: true, updatedAt: true },
+      }),
+    );
+    // The strength exercises the user added to the library
+    write(
+      'customExercises',
+      await this.prisma.customExercise.findMany({
+        where: { userId },
+        select: {
+          customExerciseId: true,
+          name: true,
+          instructions: true,
+          mediaUrl: true,
+          bodyPart: true,
+          equipment: true,
+          defaultDurationType: true,
+          defaultDurationValue: true,
+          createdAt: true,
+          updatedAt: true,
+        },
+        orderBy: { customExerciseId: 'asc' },
+      }),
+    );
+    // What the images in notes and messages are; their ids are those the
+    // texts reference
+    write(
+      'images',
+      await this.prisma.storedFile.findMany({
+        where: { ownerUserId: userId },
+        select: {
+          storedFileId: true,
+          contentType: true,
+          size: true,
+          purpose: true,
+          createdAt: true,
+        },
+        orderBy: { createdAt: 'asc' },
+      }),
+    );
+    write('aiAssistant', await this.aiAssistant(userId));
+    write('aiSettings', await this.aiSettings(userId));
+
+    sink.write('"events":[');
+    if (athleteId) {
+      await this.writeEvents(athleteId, sink, options.includeStreams);
+    }
+    sink.write(']}');
+    sink.end();
+    this.logger.log(`Data export for user ${userId}`);
+  }
+
+  private async athleteData(athleteId: number) {
+    return this.prisma.athlete.findUniqueOrThrow({
+      where: { athleteId },
+      select: {
+        createdAt: true,
+        settings: true,
+        metrics: { orderBy: { date: 'asc' } },
+        trainingZones: { include: { values: true } },
+        equipment: true,
+        injuries: true,
+        availability: true,
+        trainingPlans: true,
+        cycles: { include: { weeks: true } },
+        trainingLoadCalculations: { include: { entries: true } },
+        records: true,
+        garminPersonalConnection: {
+          select: {
+            activities: true,
+            automatic: true,
+            status: true,
+            lastSyncedAt: true,
+            createdAt: true,
+          },
+        },
+        // Connection details only, never the OAuth tokens
+        providerAccounts: {
+          select: {
+            provider: true,
+            status: true,
+            externalUserId: true,
+            scopes: true,
+            importActivitiesEnabled: true,
+            exportWorkoutsEnabled: true,
+            importMetricsEnabled: true,
+            activityDescriptionEnabled: true,
+            activityDescriptionLanguage: true,
+            createdAt: true,
+          },
+        },
+      },
+    });
+  }
+
+  /** Who coaches the user and whom they coach, by name. */
+  /** The clubs the user belongs to, and the groups they made or are in */
+  private async clubs(userId: number, athleteId: number | undefined) {
+    const groupName = { select: { name: true } };
+    return {
+      memberships: await this.prisma.clubMember.findMany({
+        where: { userId },
+        select: {
+          role: true,
+          createdAt: true,
+          club: { select: { name: true } },
+        },
+        orderBy: { clubMemberId: 'asc' },
+      }),
+      ownGroups: await this.prisma.athleteGroup.findMany({
+        where: { ownerUserId: userId },
+        select: {
+          athleteGroupId: true,
+          name: true,
+          parentId: true,
+          members: { select: { athleteId: true } },
+        },
+        orderBy: { athleteGroupId: 'asc' },
+      }),
+      entrustedGroups: await this.prisma.athleteGroupStaff.findMany({
+        where: { userId },
+        select: { group: groupName },
+      }),
+      // Whether the user said they come to club sessions
+      sessionAnswers: await this.prisma.clubSessionAttendance.findMany({
+        where: { userId },
+        select: {
+          date: true,
+          going: true,
+          session: { select: { title: true } },
+        },
+      }),
+      groupsIn: athleteId
+        ? await this.prisma.athleteGroupMember.findMany({
+            where: { athleteId },
+            select: { group: groupName },
+          })
+        : [],
+    };
+  }
+
+  private async coaching(userId: number) {
+    const [coaches, athletes] = await Promise.all([
+      this.prisma.coachAthlete.findMany({
+        where: { athlete: { userId } },
+        select: {
+          createdAt: true,
+          user: { select: { firstName: true, lastName: true } },
+        },
+      }),
+      this.prisma.coachAthlete.findMany({
+        where: { userId },
+        select: {
+          createdAt: true,
+          athlete: {
+            select: { user: { select: { firstName: true, lastName: true } } },
+          },
+        },
+      }),
+    ]);
+    return {
+      coaches: coaches.map(({ user, createdAt }) => ({
+        ...user,
+        since: createdAt,
+      })),
+      athletes: athletes.map(({ athlete, createdAt }) => ({
+        ...athlete.user,
+        since: createdAt,
+      })),
+    };
+  }
+
+  private async templates(userId: number) {
+    return this.prisma.eventTemplate.findMany({
+      where: { userId },
+      select: {
+        createdAt: true,
+        folder: { select: { name: true } },
+        event: { include: EVENT_INCLUDES },
+      },
+    });
+  }
+
+  /** Messages the user wrote; other people's messages are theirs. */
+  private async messages(userId: number) {
+    return this.prisma.message.findMany({
+      where: { senderId: userId, activityNotice: null },
+      select: { messageThreadId: true, content: true, createdAt: true },
+      orderBy: { createdAt: 'asc' },
+    });
+  }
+
+  private async aiAssistant(userId: number) {
+    return this.prisma.agentThread.findMany({
+      where: { userId },
+      include: { messages: { include: { blocks: true } } },
+    });
+  }
+
+  /** Providers, models and instructions the user set up, never the keys. */
+  private async aiSettings(userId: number) {
+    const [credentials, models, instructions, usage] = await Promise.all([
+      this.prisma.aiCredential.findMany({
+        where: { userId },
+        select: {
+          provider: true,
+          label: true,
+          apiKeyHint: true,
+          baseUrl: true,
+          createdAt: true,
+        },
+      }),
+      this.prisma.aiModelPreference.findMany({
+        where: { userId },
+        select: {
+          task: true,
+          modelId: true,
+          credential: { select: { label: true } },
+        },
+      }),
+      this.prisma.aiCustomInstruction.findMany({
+        where: { userId },
+        select: { task: true, instructions: true, updatedAt: true },
+        orderBy: { task: 'asc' },
+      }),
+      this.prisma.aiUsage.findMany({
+        where: { userId },
+        select: {
+          day: true,
+          task: true,
+          source: true,
+          inputTokens: true,
+          outputTokens: true,
+          calls: true,
+        },
+        orderBy: [{ day: 'asc' }, { task: 'asc' }],
+      }),
+    ]);
+    return {
+      keys: credentials,
+      models,
+      instructions,
+      usage: monthlyAiUsage(usage),
+    };
+  }
+
+  private async writeEvents(
+    athleteId: number,
+    sink: ExportSink,
+    includeStreams: boolean,
+  ) {
+    let cursor: number | undefined;
+    let first = true;
+    for (;;) {
+      const events = await this.prisma.event.findMany({
+        where: { athleteId },
+        orderBy: { eventId: 'asc' },
+        take: EVENT_BATCH,
+        ...(cursor ? { skip: 1, cursor: { eventId: cursor } } : {}),
+        include: {
+          ...EVENT_INCLUDES,
+          activity: {
+            include: {
+              feedbackQuestions: true,
+              segments: true,
+              weather: true,
+            },
+          },
+        },
+      });
+      for (const event of events) {
+        const { activity } = event;
+        const exported = activity
+          ? {
+              ...event,
+              activity: includeStreams
+                ? activity
+                : { ...activity, stream: undefined },
+            }
+          : event;
+        sink.write(`${first ? '' : ','}${JSON.stringify(exported)}`);
+        first = false;
+      }
+      if (events.length < EVENT_BATCH) return;
+      cursor = events[events.length - 1].eventId;
+    }
+  }
+}
+
+/**
+ * AI usage is counted per day; the export keeps its monthly totals, the
+ * shape it always had.
+ */
+export function monthlyAiUsage(
+  rows: {
+    day: Date;
+    task: string;
+    source: string;
+    inputTokens: number;
+    outputTokens: number;
+    calls: number;
+  }[],
+) {
+  const months = new Map<
+    string,
+    {
+      month: Date;
+      task: string;
+      source: string;
+      inputTokens: number;
+      outputTokens: number;
+      calls: number;
+    }
+  >();
+  for (const { day, ...row } of rows) {
+    const month = new Date(
+      Date.UTC(day.getUTCFullYear(), day.getUTCMonth(), 1),
+    );
+    const key = `${month.toISOString()}|${row.task}|${row.source}`;
+    const total = months.get(key);
+    if (total) {
+      total.inputTokens += row.inputTokens;
+      total.outputTokens += row.outputTokens;
+      total.calls += row.calls;
+    } else {
+      months.set(key, { month, ...row });
+    }
+  }
+  return [...months.values()];
+}

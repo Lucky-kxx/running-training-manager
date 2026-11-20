@@ -1,0 +1,80 @@
+import { useGetMyAthleteQuery } from '@/api/athlete';
+import { useDeleteTrainingZone } from '@/api/training-zone';
+import { LoadingScreen } from '@/components/loading-screen';
+import { Button } from '@/components/ui/button';
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog';
+import { m } from '@/paraglide/messages';
+import { useMemo, useState } from 'react';
+
+import { TRAINING_ZONE_TYPE } from '@openathlete/shared';
+
+import { TrainingZoneBulkEditor } from './training-zone-bulk-editor';
+import { TrainingZoneTable } from './training-zone-table';
+
+interface TrainingZoneListProps {
+  athleteId: number;
+  type: TRAINING_ZONE_TYPE;
+}
+
+export function TrainingZoneList({ athleteId, type }: TrainingZoneListProps) {
+  const { data: athlete, isLoading: athleteLoading } = useGetMyAthleteQuery();
+  const [editMode, setEditMode] = useState(false);
+
+  const deleteZone = useDeleteTrainingZone();
+
+  const zones = useMemo(() => {
+    return (
+      athlete?.trainingZones
+        .filter((z) => z.type === type)
+        .sort((a, b) => a.index - b.index) || []
+    );
+  }, [athlete, type]);
+
+  if (athleteLoading || !athlete) return <LoadingScreen />;
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center justify-between gap-3 px-1">
+        {zones.length === 0 && (
+          <p className="text-sm text-muted-foreground">
+            {m.no_training_zones_defined()}
+          </p>
+        )}
+        <Dialog open={editMode} onOpenChange={setEditMode}>
+          <DialogTrigger asChild>
+            <Button variant="default" size="sm" className="ml-auto">
+              {zones.length === 0 ? m.create_zones() : m.edit_zones()}
+            </Button>
+          </DialogTrigger>
+          <DialogContent
+            mobileFullscreen
+            className="max-h-[90vh] overflow-y-auto sm:max-w-2xl"
+          >
+            <DialogHeader>
+              <DialogTitle>
+                {zones.length === 0 ? m.create_zones() : m.edit_zones()}
+              </DialogTitle>
+            </DialogHeader>
+            <TrainingZoneBulkEditor
+              key={`${athleteId}:${type}`}
+              athleteId={athleteId}
+              type={type}
+              zones={zones}
+              onComplete={() => setEditMode(false)}
+            />
+          </DialogContent>
+        </Dialog>
+      </div>
+
+      {zones.length > 0 && (
+        <TrainingZoneTable zones={zones} onDelete={deleteZone.mutate} />
+      )}
+    </div>
+  );
+}

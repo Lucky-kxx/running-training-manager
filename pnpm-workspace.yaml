@@ -1,0 +1,6 @@
+packages:
+  - "apps/*"
+  - "libs/*"
+  - "libs/config/*"
+  - "e2e"
+  - "!apps/docs"

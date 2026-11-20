@@ -1,0 +1,885 @@
+/**
+ * Captures the product screenshots from the seeded screenshot stack.
+ *
+ *   pnpm --filter @openathlete/database exec tsx ../../scripts/screenshots/capture.ts [outDir] [--only=name,name]
+ *
+ * Needs start.sh running and seed.ts applied (processing finished).
+ */
+import { mkdirSync, readFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
+import { join, resolve } from 'node:path';
+
+import type { Browser, BrowserContext, Page } from '@playwright/test';
+
+import { CAMILLE_EMAIL, COACH_EMAIL, DOMAIN, PASSWORD } from './lib/accounts';
+import { CLUB_NAME } from './lib/club';
+
+/** A member of the club's marathon group, for the athlete's side of club sessions */
+const MEMBER_EMAIL = `thomas.bernard@${DOMAIN}`;
+
+const WEB = process.env.SCREENSHOTS_WEB_URL ?? 'http://localhost:5180';
+const API = process.env.SCREENSHOTS_API_URL ?? 'http://localhost:3010';
+const args = process.argv.slice(2);
+const OUT = resolve(args.find((a) => !a.startsWith('--')) ?? join(__dirname, 'out'));
+const ONLY = args.find((a) => a.startsWith('--only='))?.slice(7).split(',');
+
+const { chromium } = createRequire(join(__dirname, '..', '..', 'e2e', 'package.json'))(
+  '@playwright/test',
+) as typeof import('@playwright/test');
+
+interface Tokens {
+  accessToken: string;
+  refreshToken: string;
+}
+
+type Who = 'athlete' | 'coach' | 'member';
+type Device = 'desktop' | 'mobile';
+
+interface Shot {
+  name: string;
+  who: Who;
+  device?: Device;
+  theme?: 'light' | 'dark';
+  path: string | ((ids: Ids) => string);
+  /** Clicks and waits after the page loaded */
+  prepare?: (page: Page, ids: Ids) => Promise<void>;
+  fullPage?: boolean;
+  /** Still drawings: the player's moving ones are caught between two frames */
+  reducedMotion?: boolean;
+}
+
+interface Ids {
+  camilleAthleteId: number;
+  clubId: number;
+  memberAthleteId: number;
+  activity: Record<string, number>;
+  training: Record<string, number>;
+}
+
+async function login(email: string): Promise<Tokens> {
+  const res = await fetch(`${API}/auth/login`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password: PASSWORD }),
+  });
+  if (!res.ok) throw new Error(`Login failed for ${email}: ${res.status}`);
+  return (await res.json()) as Tokens;
+}
+
+async function api<T>(tokens: Tokens, path: string): Promise<T> {
+  const res = await fetch(`${API}${path}`, { headers: { authorization: `Bearer ${tokens.accessToken}` } });
+  if (!res.ok) throw new Error(`${path}: ${res.status}`);
+  return (await res.json()) as T;
+}
+
+interface EventRow {
+  eventId: number;
+  type: string;
+  name: string;
+  startDate: string;
+}
+
+async function findIds(athlete: Tokens, coach: Tokens, member: Tokens): Promise<Ids> {
+  const clubs = await api<{ clubId: number; name: string }[]>(coach, '/club');
+  const memberMe = await api<{ athleteId: number }>(member, '/athlete/me');
+  const day = (offset: number) => new Date(Date.now() + offset * 86_400_000).toISOString().slice(0, 10);
+  const events = await api<EventRow[]>(athlete, `/event?startDate=${day(-120)}&endDate=${day(35)}`);
+  const me = await api<{ athleteId: number }>(athlete, '/athlete/me');
+  const now = Date.now();
+  const past = events.filter((e) => new Date(e.startDate).getTime() < now);
+  const latest = (pred: (e: EventRow) => boolean) => past.filter(pred).at(-1)?.eventId ?? 0;
+  /** The activity recorded for the latest planned session of that name */
+  const doneAs = (name: string) => {
+    const training = past.filter((e) => e.type === 'TRAINING' && e.name.startsWith(name)).at(-1);
+    return past.find((e) => e.type === 'ACTIVITY' && e.startDate === training?.startDate)?.eventId ?? 0;
+  };
+  const nextStrength = events.find(
+    (e) => e.type === 'TRAINING' && e.name.startsWith('Strength') && new Date(e.startDate).getTime() > now,
+  );
+  return {
+    camilleAthleteId: me.athleteId,
+    clubId: clubs.find((c) => c.name === CLUB_NAME)?.clubId ?? 0,
+    memberAthleteId: memberMe.athleteId,
+    activity: {
+      strength: latest((e) => e.type === 'ACTIVITY' && e.name === 'Strength'),
+      longTrail: latest((e) => e.type === 'ACTIVITY' && e.name === 'Quintal Trail Running'),
+      race: latest((e) => e.type === 'ACTIVITY' && e.name.startsWith('Ultra-Trail')),
+      tenK: latest((e) => e.type === 'ACTIVITY' && e.name.includes('10 km')),
+      intervals: doneAs('6 × 1000'),
+      longRun: doneAs('Long run'),
+    },
+    training: { nextStrength: nextStrength?.eventId ?? 0 },
+  };
+}
+
+interface Viewport {
+  width: number;
+  height: number;
+  isMobile: boolean;
+  hasTouch: boolean;
+  /** Safe-area insets, as Capacitor reports them in the native apps. */
+  safeArea?: { top: number; bottom: number };
+}
+
+// The phone is an iPhone 15 Pro: the website draws its status bar, Dynamic
+// Island and home indicator over the insets, so content must clear them
+const VIEWPORTS: Record<Device, Viewport> = {
+  desktop: { width: 1440, height: 900, isMobile: false, hasTouch: false },
+  mobile: {
+    width: 393,
+    height: 852,
+    isMobile: true,
+    hasTouch: true,
+    safeArea: { top: 59, bottom: 34 },
+  },
+};
+
+async function newContext(browser: Browser, tokens: Tokens, shot: Shot): Promise<BrowserContext> {
+  const device = VIEWPORTS[shot.device ?? 'desktop'];
+  const context = await browser.newContext({
+    viewport: { width: device.width, height: device.height },
+    // 3 for store artwork (SCREENSHOT_SCALE=3), 2 for the website
+    deviceScaleFactor: Number(process.env.SCREENSHOT_SCALE ?? 2),
+    isMobile: device.isMobile,
+    hasTouch: device.hasTouch,
+    locale: 'en-GB',
+    timezoneId: 'Europe/Paris',
+    colorScheme: shot.theme ?? 'light',
+    reducedMotion: shot.reducedMotion ? 'reduce' : 'no-preference',
+  });
+  await context.addCookies([{ name: 'OA_LOCALE', value: 'en', url: WEB }]);
+  await context.addInitScript(
+    ({ tokens, space, theme }) => {
+      localStorage.setItem('access_token', tokens.accessToken);
+      localStorage.setItem('refresh_token', tokens.refreshToken);
+      localStorage.setItem('current_space', space);
+      localStorage.setItem('theme', theme);
+      localStorage.setItem('openathlete-tracking-consent-v2', 'denied');
+      localStorage.setItem('openathlete_push_prompt_dismissed', 'true');
+    },
+    { tokens, space: shot.who === 'coach' ? 'COACH' : 'ATHLETE', theme: shot.theme ?? 'light' },
+  );
+  if (device.safeArea) {
+    // The app's theme reads these before env(safe-area-inset-*). The safe
+    // area plugin rewrites them inline on start, hence a rule that wins.
+    // Added once the head exists: an earlier element would be dropped
+    await context.addInitScript(({ top, bottom }) => {
+      document.addEventListener('DOMContentLoaded', () => {
+        const style = document.createElement('style');
+        style.textContent = `:root { --safe-area-inset-top: ${top}px !important; --safe-area-inset-bottom: ${bottom}px !important; }`;
+        document.head.appendChild(style);
+      });
+    }, device.safeArea);
+  }
+  return context;
+}
+
+/** Waits for requests, skeletons and map tiles to settle. */
+async function settle(page: Page) {
+  await page.waitForLoadState('networkidle', { timeout: 20_000 }).catch(() => undefined);
+  await page
+    .waitForFunction(() => !document.querySelector('.animate-pulse, [data-slot="skeleton"], .animate-spin'), undefined, {
+      timeout: 15_000,
+    })
+    .catch(() => undefined);
+  if (await page.locator('.leaflet-container').count()) {
+    await page
+      .waitForFunction(
+        () => {
+          const tiles = Array.from(document.querySelectorAll<HTMLImageElement>('.leaflet-tile'));
+          return tiles.length > 0 && tiles.every((t) => t.complete);
+        },
+        undefined,
+        { timeout: 20_000 },
+      )
+      .catch(() => console.warn('  map tiles did not all load')); // eslint-disable-line no-console
+  }
+  // Chart animations
+  await page.waitForTimeout(1500);
+}
+
+const HIDE = `
+  [data-sonner-toaster], .Toastify, [data-tanstack-query-devtools] { display: none !important; }
+  * { caret-color: transparent !important; }
+`;
+
+async function take(browser: Browser, tokens: Record<Who, Tokens>, ids: Ids, shot: Shot) {
+  const context = await newContext(browser, tokens[shot.who], shot);
+  const page = await context.newPage();
+  const path = typeof shot.path === 'function' ? shot.path(ids) : shot.path;
+  await page.goto(`${WEB}${path}`);
+  await page.addStyleTag({ content: HIDE });
+  await settle(page);
+  if (shot.prepare) {
+    await shot.prepare(page, ids);
+    await settle(page);
+  }
+  await page.addStyleTag({ content: HIDE });
+  await page.screenshot({ path: join(OUT, `${shot.name}.png`), fullPage: shot.fullPage ?? false });
+  await context.close();
+  console.log(`  ${shot.name}`); // eslint-disable-line no-console
+}
+
+/** Scrolls the page so the first element with that text sits near the top. */
+const scrollTo = (text: string | RegExp, offset = 24, which: 'first' | 'last' = 'first') => async (page: Page) => {
+  const matches = page.getByText(text);
+  await (which === 'last' ? matches.last() : matches.first())
+    .evaluate((el, off) => {
+      el.scrollIntoView({ block: 'start' });
+      // Pages scroll in <main> or the window, sheets in their own container
+      let scroller: Element | null = el.parentElement;
+      while (scroller && scroller !== document.body) {
+        const { overflowY } = getComputedStyle(scroller);
+        if (/(auto|scroll)/.test(overflowY) && scroller.scrollHeight > scroller.clientHeight) break;
+        scroller = scroller.parentElement;
+      }
+      if (scroller && scroller !== document.body) scroller.scrollBy(0, -off);
+      else window.scrollBy(0, -off);
+    }, offset);
+};
+
+const calendarView = (view: 'Month' | 'Week' | 'Season') => async (page: Page) => {
+  await page.getByRole('tab', { name: view }).click();
+};
+
+/** Opens a session from the calendar week. */
+const openSession = (name: string) => async (page: Page) => {
+  await calendarView('Week')(page);
+  await page.waitForTimeout(1500);
+  await page.locator('main').getByText(name).last().click();
+  await page.waitForTimeout(1500);
+};
+
+/** Opens a session of the coming weeks from the calendar week, moving forward until it shows. */
+const openUpcoming = (name: string) => async (page: Page) => {
+  await calendarView('Week')(page);
+  await page.waitForTimeout(1200);
+  // From next week: this week's session may already be done. The phone
+  // agenda has no week buttons: it lists the coming days, upcoming last
+  const next = page.getByRole('button', { name: 'Next week' });
+  if (!(await next.isVisible())) {
+    await page.locator('.calendar-event', { hasText: name }).last().click();
+    await page.waitForTimeout(1500);
+    return;
+  }
+  await next.click();
+  await page.waitForTimeout(1200);
+  for (let week = 0; week < 4; week++) {
+    const card = page.locator('.calendar-event', { hasText: name });
+    if (await card.count()) {
+      await card.first().click();
+      await page.waitForTimeout(1500);
+      return;
+    }
+    await page.getByRole('button', { name: 'Next week' }).click();
+    await page.waitForTimeout(1200);
+  }
+  throw new Error(`${name} not found in the coming weeks`);
+};
+
+const editOpenSession = async (page: Page) => {
+  await page.getByRole('dialog').getByRole('button', { name: 'Edit' }).click();
+  await page.waitForTimeout(1200);
+};
+
+/** The player, started and taken to the squats past the warm-up */
+const playToSquats = async (page: Page) => {
+  await page.locator('[data-player-start]').click();
+  await page.waitForTimeout(600);
+  await page.locator('[data-player-skip]').click();
+  await page.waitForTimeout(800);
+};
+
+const steps =
+  (...fns: ((page: Page, ids: Ids) => Promise<void>)[]) =>
+  async (page: Page, ids: Ids) => {
+    for (const fn of fns) {
+      await fn(page, ids);
+      await page.waitForTimeout(800);
+    }
+  };
+
+const statisticsTab = (name: string) => async (page: Page) => {
+  await page.getByRole('tab', { name }).click();
+};
+
+const statisticsPeriod = (label: string) => async (page: Page) => {
+  await page.getByRole('combobox').first().click();
+  await page.getByRole('option', { name: label }).click();
+};
+
+/** Scrolls the first element matching the selector near the top of its scroller. */
+const scrollToSelector = (selector: string, offset = 24) => async (page: Page) => {
+  await page.locator(selector).first().evaluate((el, off) => {
+    el.scrollIntoView({ block: 'start' });
+    let scroller: Element | null = el.parentElement;
+    while (scroller && scroller !== document.body) {
+      const { overflowY } = getComputedStyle(scroller);
+      if (/(auto|scroll)/.test(overflowY) && scroller.scrollHeight > scroller.clientHeight) break;
+      scroller = scroller.parentElement;
+    }
+    if (scroller && scroller !== document.body) scroller.scrollBy(0, -off);
+    else window.scrollBy(0, -off);
+  }, offset);
+};
+
+/** Brings Garmin's attribution of that kind to the middle of the screen */
+const revealGarmin = (kind: 'activity' | 'metric' | 'data' | 'insights') => async (page: Page) => {
+  // Sections load as they come into view and push the line further down
+  for (let i = 0; i < 4; i++) {
+    await page.locator(`[data-garmin-attribution="${kind}"]`).last().evaluate((el) => el.scrollIntoView({ block: 'end' }));
+    await page.waitForTimeout(1500);
+  }
+};
+
+/**
+ * Clicks what downloads a file, keeps the file next to the shots, and shows
+ * a text file's end in the page so the shot shows its attribution line.
+ */
+const download = (trigger: string, file: string, showText = false) => async (page: Page) => {
+  // Chromium offers the share sheet for files: the app then shares instead of saving
+  await page.evaluate(() => Object.defineProperty(navigator, 'canShare', { value: undefined }));
+  const [received] = await Promise.all([page.waitForEvent('download'), page.locator(trigger).first().click()]);
+  const path = join(OUT, file);
+  await received.saveAs(path);
+  if (showText) {
+    const lines = readFileSync(path, 'utf8').trimEnd().split('\n');
+    const shown = [...lines.slice(0, 4), '…', ...lines.slice(-6)].join('\n');
+    await page.setContent(
+      `<pre style="font: 15px/1.5 ui-monospace, monospace; padding: 32px; white-space: pre-wrap">${file}\n\n${shown.replace(/</g, '&lt;')}</pre>`,
+    );
+  }
+};
+
+const clubPage = (ids: Ids) => `/dashboard/settings?tab=clubs&club=${ids.clubId}`;
+const group = (name: string) => `+ ${CLUB_NAME} · ${name}`;
+
+const MEMBER_LIST = [
+  'First name;Last name;Email;Group',
+  'Mathis;Chevallier;mathis.chevallier@example.com;Beginners · 10 km',
+  'Anaïs;Lemoine;anais.lemoine@example.com;Beginners · 10 km',
+  'Quentin;Barbier;quentin.barbier@example.com;Trail',
+  'Océane;Renaud;oceane.renaud@example.com;Road · Marathon',
+  'Hélène;Marchand;helene.marchand@example.com;Triathlon',
+  'Yanis;Brunet;yanis.brunet@example.com;Beginners · 10 km',
+].join('\n');
+
+const openNewClubSession = async (page: Page) => {
+  await page.locator('[data-club-session-new]').click();
+  const dialog = page.locator('[data-club-session-dialog]');
+  await dialog.getByLabel('Name').fill('Hill repeats at Semnoz');
+  await dialog.getByLabel('Place').fill('Crêt de Châtillon car park');
+  await dialog.getByLabel('Until (optional)').fill('2027-03-30');
+  await dialog.getByLabel('Notes for the athletes').fill('Headlamp from November. We go up together, everyone comes down at their own pace.');
+  await page.waitForTimeout(600);
+};
+
+const openImport = async (page: Page) => {
+  await page.locator('[data-club-import-button]').click();
+  await page.locator('[data-club-import] textarea').fill(MEMBER_LIST);
+  await page.waitForTimeout(800);
+};
+
+/** The coach copies Thomas's club week to the trail group, then reviews it */
+const planForGroup = async (page: Page) => {
+  await page.getByRole('tab', { name: 'Week' }).click().catch(() => undefined);
+  await page.waitForTimeout(1200);
+  // Three weeks ahead the week holds the club's sessions alone: the copies
+  // land on free days, as a coach planning ahead would see them
+  const next = page.getByRole('button', { name: 'Next week' });
+  if (await next.isVisible()) {
+    for (let week = 0; week < 3; week++) {
+      await next.click();
+      await page.waitForTimeout(800);
+    }
+    await page.locator('[data-week-actions]').first().click();
+  } else {
+    // The phone lists the weeks: the furthest one shown
+    await page.locator('[data-week-actions]').last().click();
+  }
+  await page.getByRole('menuitem', { name: 'Copy to other athletes' }).click();
+  const dialog = page.locator('[data-plan-for-athletes]');
+  await dialog.getByRole('button', { name: group('Trail') }).click();
+  await page.waitForTimeout(400);
+  await dialog.getByRole('button', { name: 'Review' }).click();
+  await page.waitForTimeout(1200);
+};
+
+/** A Wednesday three weeks ahead, free in every calendar, as YYYY-MM-DD */
+function wednesdayAhead(): string {
+  const day = new Date();
+  day.setDate(day.getDate() + 21 + ((3 - day.getDay() + 7) % 7));
+  return day.toLocaleDateString('en-CA');
+}
+
+/** A library session planned for a group from the library itself */
+const planTemplateForGroup = (template: string, groupName: string) => async (page: Page) => {
+  // On a touch screen the item's buttons show without hover
+  await page
+    .locator('.group', { has: page.getByText(template, { exact: true }) })
+    .locator('[data-template-plan-for-athletes]')
+    .first()
+    .click();
+  const dialog = page.locator('[data-plan-for-athletes]');
+  await dialog.locator('input[type="date"]').fill(wednesdayAhead());
+  await dialog.getByRole('button', { name: group(groupName) }).click();
+  await page.waitForTimeout(400);
+  await dialog.getByRole('button', { name: 'Review' }).click();
+  await page.waitForTimeout(1200);
+};
+
+const writeToGroup = async (page: Page) => {
+  await page.locator('[data-broadcast-button]').first().click();
+  const dialog = page.locator('[data-broadcast-dialog]');
+  await dialog.getByRole('button', { name: group('Trail') }).click();
+  await dialog.getByLabel('Message').fill(
+    'Snow is forecast on the Semnoz on Thursday: we run the hills from the Col de Leschaux instead. Same time, headlamps on.',
+  );
+  // Back to the top of the dialog, where its title is
+  await dialog.evaluate((el) => {
+    for (const node of [el, ...Array.from(el.querySelectorAll('*'))]) node.scrollTop = 0;
+  });
+  await page.waitForTimeout(600);
+};
+
+/** The template library, switched to the club's */
+const openClubLibrary = async (page: Page) => {
+  await page.locator('[data-library-switch]').click();
+  await page.getByRole('option', { name: `${CLUB_NAME} library` }).click();
+  await page.waitForTimeout(800);
+};
+
+export const SHOTS: Shot[] = [
+  // Clubs, coach side
+  { name: 'desktop-club', who: 'coach', path: clubPage },
+  { name: 'desktop-club-sessions', who: 'coach', path: clubPage, prepare: scrollToSelector('[data-club-session]', 120) },
+  { name: 'desktop-club-session-new', who: 'coach', path: clubPage, prepare: steps(scrollToSelector('[data-club-session]', 120), openNewClubSession) },
+  { name: 'desktop-club-join', who: 'coach', path: clubPage, prepare: scrollToSelector('[data-club-join-link]', 160) },
+  { name: 'desktop-club-import', who: 'coach', path: clubPage, prepare: steps(scrollToSelector('[data-club-invitations]', 160), openImport) },
+  { name: 'desktop-plan-for-group', who: 'coach', path: (ids) => `/dashboard/calendar/${ids.memberAthleteId}?view=week`, prepare: planForGroup },
+  { name: 'desktop-broadcast', who: 'coach', path: '/dashboard/messages', prepare: writeToGroup },
+  {
+    name: 'desktop-coach-alerts',
+    who: 'coach',
+    path: '/dashboard/coach',
+    prepare: async (p) => p.getByRole('button', { name: 'Alerts' }).click(),
+  },
+  {
+    name: 'desktop-club-library',
+    who: 'coach',
+    path: (ids) => `/dashboard/calendar/${ids.memberAthleteId}?view=week`,
+    prepare: steps(calendarView('Week'), async (p) => p.getByRole('button', { name: /Template Library/i }).click(), openClubLibrary),
+  },
+  { name: 'desktop-club-session-athlete', who: 'member', path: '/dashboard/calendar', prepare: openUpcoming('Sunday long run') },
+  // Clubs, on a phone
+  { name: 'mobile-club', who: 'coach', device: 'mobile', path: clubPage },
+  { name: 'mobile-club-sessions', who: 'coach', device: 'mobile', path: clubPage, prepare: scrollToSelector('[data-club-session]', 140 + 59) },
+  { name: 'mobile-club-session-new', who: 'coach', device: 'mobile', path: clubPage, prepare: steps(scrollToSelector('[data-club-session]', 140 + 59), openNewClubSession) },
+  { name: 'mobile-club-join', who: 'coach', device: 'mobile', path: clubPage, prepare: scrollToSelector('[data-club-join-link]', 160 + 59) },
+  { name: 'mobile-club-import', who: 'coach', device: 'mobile', path: clubPage, prepare: steps(scrollToSelector('[data-club-invitations]', 160 + 59), openImport) },
+  {
+    name: 'mobile-plan-for-group',
+    who: 'coach',
+    device: 'mobile',
+    path: '/dashboard/calendar',
+    prepare: steps(
+      async (p) => p.locator('[data-calendar-options]').click(),
+      async (p) => p.locator('[data-calendar-template-library]').click(),
+      openClubLibrary,
+      planTemplateForGroup("Hill repeats 10 × 1'30", 'Trail'),
+    ),
+  },
+  { name: 'mobile-broadcast', who: 'coach', device: 'mobile', path: '/dashboard/messages', prepare: writeToGroup },
+  { name: 'mobile-coach-alerts', who: 'coach', device: 'mobile', path: '/dashboard/coach', prepare: async (p) => p.getByRole('button', { name: 'Alerts' }).click() },
+  {
+    name: 'mobile-club-library',
+    who: 'coach',
+    device: 'mobile',
+    path: '/dashboard/calendar',
+    prepare: steps(
+      async (p) => p.locator('[data-calendar-options]').click(),
+      async (p) => p.locator('[data-calendar-template-library]').click(),
+      openClubLibrary,
+    ),
+  },
+  { name: 'mobile-club-session-athlete', who: 'member', device: 'mobile', path: '/dashboard/calendar', prepare: openUpcoming('Sunday long run') },
+
+  // Athlete, desktop
+  { name: 'desktop-calendar-month', who: 'athlete', path: '/dashboard/calendar', prepare: calendarView('Month') },
+  {
+    name: 'desktop-calendar-month-grid',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(calendarView('Month'), scrollTo(/^Calendar of /)),
+  },
+  { name: 'desktop-calendar-week', who: 'athlete', path: '/dashboard/calendar', prepare: steps(calendarView('Week'), scrollTo(/^Calendar of /)) },
+  { name: 'desktop-calendar-season', who: 'athlete', path: '/dashboard/calendar', prepare: steps(calendarView('Season'), scrollTo(/^Calendar of /)) },
+  { name: 'desktop-session-detail', who: 'athlete', path: '/dashboard/calendar', prepare: openSession('6 × 1000 m') },
+  {
+    name: 'desktop-workout-editor',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(openSession('6 × 1000 m'), editOpenSession),
+  },
+  {
+    name: 'desktop-workout-editor-text',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(openSession('6 × 1000 m'), editOpenSession, async (p) =>
+      p.locator('[data-builder-mode="text"]').click(),
+    ),
+  },
+  {
+    name: 'desktop-strength-editor',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(openUpcoming('Strength: legs & core'), editOpenSession),
+  },
+  {
+    name: 'desktop-exercise-library',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(openUpcoming('Strength: legs & core'), editOpenSession, async (p) => {
+      await p.locator('[data-add-exercise]').click();
+      await p.locator('[data-exercise-search]').fill('squat');
+      await p.waitForTimeout(600);
+    }),
+    // Drawings caught mid-crossfade look blurred: show them still
+    reducedMotion: true,
+  },
+  {
+    name: 'desktop-strength-session-detail',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: openUpcoming('Strength: legs & core'),
+  },
+  {
+    name: 'desktop-player-ready',
+    who: 'athlete',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+  },
+  {
+    name: 'desktop-player-exercise',
+    who: 'athlete',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+    prepare: playToSquats,
+  },
+  {
+    name: 'desktop-player-rest',
+    who: 'athlete',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+    prepare: steps(playToSquats, async (p) => p.locator('[data-player-primary]').click()),
+  },
+  { name: 'desktop-activity-strength', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.strength}` },
+  {
+    name: 'desktop-template-library',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(calendarView('Week'), async (p) => p.getByRole('button', { name: /Template Library/i }).click()),
+  },
+  { name: 'desktop-activity-trail', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  {
+    name: 'desktop-activity-trail-summary',
+    who: 'athlete',
+    path: (ids) => `/dashboard/activity/${ids.activity.longTrail}`,
+    prepare: scrollTo(/^Planned as/),
+  },
+  {
+    name: 'desktop-activity-trail-charts',
+    who: 'athlete',
+    path: (ids) => `/dashboard/activity/${ids.activity.longTrail}`,
+    prepare: scrollTo(/^Charts$/, 24, 'last'),
+  },
+  {
+    name: 'desktop-activity-trail-conditions',
+    who: 'athlete',
+    path: (ids) => `/dashboard/activity/${ids.activity.longTrail}`,
+    prepare: async (p) => p.getByRole('tab', { name: 'Conditions' }).click(),
+  },
+  { name: 'desktop-activity-intervals', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.intervals}` },
+  {
+    name: 'desktop-activity-intervals-laps',
+    who: 'athlete',
+    path: (ids) => `/dashboard/activity/${ids.activity.intervals}`,
+    prepare: scrollTo(/^Laps and intervals$/, 24, 'last'),
+  },
+  { name: 'desktop-activity-race', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.race}` },
+  { name: 'desktop-statistics-overview', who: 'athlete', path: '/dashboard/statistics' },
+  { name: 'desktop-statistics-load', who: 'athlete', path: '/dashboard/statistics', prepare: statisticsTab('Load') },
+  {
+    name: 'desktop-statistics-load-year',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsPeriod('12 months'), statisticsTab('Load')),
+  },
+  { name: 'desktop-statistics-capacities', who: 'athlete', path: '/dashboard/statistics', prepare: statisticsTab('Capacities') },
+  {
+    name: 'desktop-statistics-capacities-trail',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsTab('Capacities'), async (p) => p.getByRole('tab', { name: 'Trail Running' }).click()),
+  },
+  { name: 'desktop-statistics-trends', who: 'athlete', path: '/dashboard/statistics', prepare: statisticsTab('Trends') },
+  { name: 'desktop-statistics-year', who: 'athlete', path: '/dashboard/statistics', prepare: statisticsTab('Year in review') },
+  { name: 'desktop-records', who: 'athlete', path: '/dashboard/records' },
+  { name: 'desktop-metrics', who: 'athlete', path: '/dashboard/metrics' },
+  { name: 'desktop-settings-zones', who: 'athlete', path: '/dashboard/settings?tab=training_zones' },
+  {
+    name: 'desktop-settings-zones-pace',
+    who: 'athlete',
+    path: '/dashboard/settings?tab=training_zones',
+    prepare: async (p) => p.getByRole('tab', { name: 'Pace' }).click(),
+  },
+  { name: 'desktop-settings-connectors', who: 'athlete', path: '/dashboard/settings?tab=connectors' },
+  { name: 'desktop-settings-ai', who: 'athlete', path: '/dashboard/settings?tab=ai' },
+  { name: 'desktop-settings-ai-keys', who: 'athlete', path: '/dashboard/settings?tab=ai', prepare: scrollTo(/^API keys$/) },
+  { name: 'desktop-settings-subscription', who: 'athlete', path: '/dashboard/settings?tab=subscription' },
+  {
+    name: 'desktop-messages',
+    who: 'athlete',
+    path: '/dashboard/messages',
+    prepare: async (p) => p.getByText(/^Julien Moreau, Camille/).first().click(),
+  },
+  // Coach, desktop
+  { name: 'desktop-coach-dashboard', who: 'coach', path: '/dashboard/coach' },
+  { name: 'desktop-coach-athletes', who: 'coach', path: '/dashboard/settings?tab=athletes' },
+  {
+    name: 'desktop-coach-athlete-calendar',
+    who: 'coach',
+    path: (ids) => `/dashboard/calendar/${ids.camilleAthleteId}`,
+    prepare: steps(calendarView('Month'), scrollTo(/^Calendar of /)),
+  },
+  {
+    name: 'desktop-coach-athlete-week',
+    who: 'coach',
+    path: (ids) => `/dashboard/calendar/${ids.camilleAthleteId}`,
+    prepare: calendarView('Week'),
+  },
+  { name: 'desktop-coach-athlete-statistics', who: 'coach', path: (ids) => `/dashboard/statistics/${ids.camilleAthleteId}` },
+  {
+    name: 'desktop-coach-template-library',
+    who: 'coach',
+    path: (ids) => `/dashboard/calendar/${ids.camilleAthleteId}`,
+    prepare: steps(calendarView('Week'), async (p) => p.getByRole('button', { name: /Template Library/i }).click()),
+  },
+  // Garmin's production review: every place its data and brand appear
+  { name: 'garmin-01-connectors', who: 'athlete', path: '/dashboard/settings?tab=connectors' },
+  { name: 'garmin-02-activity', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  {
+    name: 'garmin-03-activity-ai-summary',
+    who: 'athlete',
+    path: (ids) => `/dashboard/activity/${ids.activity.longTrail}`,
+    prepare: scrollToSelector('[data-ai-summary]', 120),
+  },
+  { name: 'garmin-04-activity-race', who: 'athlete', path: (ids) => `/dashboard/activity/${ids.activity.race}` },
+  { name: 'garmin-05-mobile-activity', who: 'athlete', device: 'mobile', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  { name: 'garmin-06-dashboard-header', who: 'athlete', path: '/dashboard/calendar', prepare: calendarView('Month') },
+  {
+    name: 'garmin-07-calendar-month',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(calendarView('Month'), revealGarmin('data')),
+  },
+  {
+    name: 'garmin-08-calendar-week',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    // Last week: this one has no activity yet on Monday
+    prepare: steps(
+      calendarView('Week'),
+      async (p) => p.getByRole('button', { name: 'Previous week' }).click(),
+      scrollTo(/^Calendar of /),
+    ),
+  },
+  {
+    name: 'garmin-09-calendar-season',
+    who: 'athlete',
+    path: '/dashboard/calendar',
+    prepare: steps(calendarView('Season'), revealGarmin('data')),
+  },
+  {
+    name: 'garmin-10-mobile-calendar-month',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/calendar',
+    // Back to the last activities: the agenda opens on the start of its range
+    prepare: steps(calendarView('Month'), async (p) => {
+      const today = p.locator('[data-calendar-today]');
+      if (await today.isVisible()) await today.click();
+    }),
+  },
+  { name: 'garmin-11-mobile-calendar-week', who: 'athlete', device: 'mobile', path: '/dashboard/calendar', prepare: calendarView('Week') },
+  { name: 'garmin-12-mobile-today', who: 'athlete', device: 'mobile', path: '/dashboard/today' },
+  {
+    name: 'garmin-13-mobile-today-recent',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/today',
+    prepare: scrollTo(/^Latest activities$/, 16 + 59),
+  },
+  { name: 'garmin-14-metrics', who: 'athlete', path: '/dashboard/metrics' },
+  { name: 'garmin-15-metric-chart', who: 'athlete', path: '/dashboard/metrics', prepare: revealGarmin('data') },
+  {
+    name: 'garmin-16-metric-history',
+    who: 'athlete',
+    path: '/dashboard/metrics',
+    prepare: scrollTo(/^History$/, 120),
+  },
+  { name: 'garmin-17-mobile-metrics', who: 'athlete', device: 'mobile', path: '/dashboard/metrics' },
+  {
+    name: 'garmin-18-statistics',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: revealGarmin('insights'),
+  },
+  {
+    name: 'garmin-19-statistics-load',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsTab('Load'), revealGarmin('insights')),
+  },
+  {
+    name: 'garmin-19-statistics-recovery',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsTab('Load'), scrollToSelector('#recovery', 24)),
+  },
+  { name: 'garmin-20-records', who: 'athlete', path: '/dashboard/records', prepare: revealGarmin('insights') },
+  { name: 'garmin-21-coach-dashboard', who: 'coach', path: '/dashboard/coach', prepare: revealGarmin('insights') },
+  {
+    name: 'garmin-22-coach-athlete-calendar',
+    who: 'coach',
+    path: (ids) => `/dashboard/calendar/${ids.camilleAthleteId}`,
+    prepare: calendarView('Month'),
+  },
+  {
+    name: 'garmin-23-export-csv',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsTab('Load'), download('[data-export="load"]', 'garmin-23-export.csv', true)),
+  },
+  {
+    name: 'garmin-24-year-in-review',
+    who: 'athlete',
+    path: '/dashboard/statistics',
+    prepare: steps(statisticsTab('Year in review'), download('[data-year-share]', 'garmin-24-year-image.png')),
+  },
+  { name: 'garmin-25-dark-activity', who: 'athlete', theme: 'dark', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  // Dark theme
+  { name: 'desktop-dark-calendar-week', who: 'athlete', theme: 'dark', path: '/dashboard/calendar', prepare: steps(calendarView('Week'), scrollTo(/^Calendar of /)) },
+  { name: 'desktop-dark-activity-trail', who: 'athlete', theme: 'dark', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  { name: 'desktop-dark-statistics-load', who: 'athlete', theme: 'dark', path: '/dashboard/statistics', prepare: statisticsTab('Load') },
+  { name: 'desktop-dark-coach-dashboard', who: 'coach', theme: 'dark', path: '/dashboard/coach' },
+  // Mobile
+  { name: 'mobile-today', who: 'athlete', device: 'mobile', path: '/dashboard/today' },
+  { name: 'mobile-calendar', who: 'athlete', device: 'mobile', path: '/dashboard/calendar', prepare: calendarView('Week') },
+  { name: 'mobile-calendar-month', who: 'athlete', device: 'mobile', path: '/dashboard/calendar', prepare: calendarView('Month') },
+  { name: 'mobile-activity', who: 'athlete', device: 'mobile', path: (ids) => `/dashboard/activity/${ids.activity.longTrail}` },
+  {
+    name: 'mobile-activity-map',
+    who: 'athlete',
+    device: 'mobile',
+    path: (ids) => `/dashboard/activity/${ids.activity.longTrail}`,
+    prepare: scrollTo(/^Statistics$/, 16 + 59, 'last'),
+  },
+  {
+    name: 'mobile-workout-detail',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/today',
+    prepare: steps(async (p) => p.getByText('6 × 1000 m').first().click(), scrollTo(/^Description$/, 16 + 59)),
+  },
+  {
+    name: 'mobile-messages',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/messages',
+    prepare: async (p) => p.getByText(/^Julien Moreau, Camille/).first().click(),
+  },
+  { name: 'mobile-statistics', who: 'athlete', device: 'mobile', path: '/dashboard/statistics' },
+  {
+    name: 'mobile-statistics-load',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/statistics',
+    prepare: statisticsTab('Load'),
+  },
+  { name: 'mobile-records', who: 'athlete', device: 'mobile', path: '/dashboard/records' },
+  { name: 'mobile-metrics', who: 'athlete', device: 'mobile', path: '/dashboard/metrics' },
+  { name: 'mobile-coach-dashboard', who: 'coach', device: 'mobile', path: '/dashboard/coach' },
+  {
+    name: 'mobile-player-ready',
+    who: 'athlete',
+    device: 'mobile',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+  },
+  {
+    name: 'mobile-player-exercise',
+    who: 'athlete',
+    device: 'mobile',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+    prepare: playToSquats,
+  },
+  {
+    name: 'mobile-player-rest',
+    who: 'athlete',
+    device: 'mobile',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+    prepare: steps(playToSquats, async (p) => p.locator('[data-player-primary]').click()),
+  },
+  {
+    name: 'mobile-dark-player-exercise',
+    who: 'athlete',
+    device: 'mobile',
+    theme: 'dark',
+    path: (ids) => `/play/${ids.training.nextStrength}`,
+    reducedMotion: true,
+    prepare: playToSquats,
+  },
+  {
+    name: 'mobile-strength-editor',
+    who: 'athlete',
+    device: 'mobile',
+    path: '/dashboard/calendar',
+    prepare: steps(openUpcoming('Strength: legs & core'), editOpenSession, scrollTo(/^Barbell full squat$/, 120)),
+  },
+];
+
+async function main() {
+  mkdirSync(OUT, { recursive: true });
+  const tokens = { athlete: await login(CAMILLE_EMAIL), coach: await login(COACH_EMAIL), member: await login(MEMBER_EMAIL) };
+  const ids = await findIds(tokens.athlete, tokens.coach, tokens.member);
+  console.log('ids', JSON.stringify(ids)); // eslint-disable-line no-console
+  // Native date and time inputs follow the browser's language, not the
+  // page's: the headless shell ignores it, full Chromium takes it
+  const browser = await chromium.launch({ channel: 'chromium', args: ['--lang=en-GB'] });
+  try {
+    for (const shot of SHOTS.filter((s) => !ONLY || ONLY.includes(s.name))) {
+      // Scrolling to a section sometimes races the page's own layout: retry once
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          await take(browser, tokens, ids, shot);
+          break;
+        } catch (err) {
+          const message = (err as Error).message.split('\n')[0];
+          console.error(`  ${shot.name} failed (attempt ${attempt}): ${message}`); // eslint-disable-line no-console
+        }
+      }
+    }
+  } finally {
+    await browser.close();
+  }
+}
+
+if (require.main === module) {
+  main().catch((err) => {
+    console.error(err); // eslint-disable-line no-console
+    process.exitCode = 1;
+  });
+}

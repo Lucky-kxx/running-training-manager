@@ -1,0 +1,81 @@
+import client, { routes } from '@/utils/axios';
+
+import {
+  CompleteOnboardingDto,
+  CreateAccountDto,
+  EmailLanguage,
+  PasswordResetDto,
+  PasswordResetRequestDto,
+  SignupAttribution,
+  UpdateAccountDto,
+  User,
+} from '@openathlete/shared';
+
+export class UserAPI {
+  static async createAccount(body: CreateAccountDto): Promise<User> {
+    const res = await client.post(routes.user.createAccount, body);
+    return res.data;
+  }
+
+  static async updateAccount(body: UpdateAccountDto): Promise<User> {
+    const res = await client.patch(routes.user.updateAccount, body);
+    return res.data;
+  }
+
+  static async getMe(): Promise<User> {
+    const res = await client.get(routes.user.getMe);
+    return res.data;
+  }
+
+  static async updateLanguage(language: EmailLanguage): Promise<void> {
+    await client.patch(routes.user.updateLanguage, { language });
+  }
+
+  static async passwordResetRequest(
+    body: PasswordResetRequestDto,
+  ): Promise<void> {
+    await client.post(routes.user.passwordResetRequest, body);
+  }
+
+  static async passwordReset(body: PasswordResetDto): Promise<void> {
+    await client.post(routes.user.passwordReset, body);
+  }
+
+  static async completeOnboarding(
+    body: CompleteOnboardingDto,
+  ): Promise<{ success: boolean }> {
+    const res = await client.post(routes.user.completeOnboarding, body);
+    return res.data;
+  }
+
+  static async updatePushToken(
+    pushToken: string,
+  ): Promise<{ success: boolean }> {
+    const res = await client.patch(routes.user.updatePushToken, { pushToken });
+    return res.data;
+  }
+
+  /** All of the user's data as a JSON file (GDPR portability). */
+  static async exportData(includeStreams: boolean): Promise<Blob> {
+    const res = await client.get(routes.user.exportData, {
+      params: { includeStreams },
+      responseType: 'blob',
+    });
+    return res.data;
+  }
+
+  static async setAnalyticsConsent(granted: boolean): Promise<void> {
+    await client.put(routes.user.analyticsConsent, { granted });
+  }
+
+  static async recordSignupAttribution(
+    attribution: SignupAttribution,
+  ): Promise<void> {
+    await client.put(routes.user.signupAttribution, attribution);
+  }
+
+  static async deleteAccount(): Promise<{ success: boolean }> {
+    const res = await client.delete(routes.user.deleteAccount);
+    return res.data;
+  }
+}

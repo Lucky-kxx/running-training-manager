@@ -1,0 +1,219 @@
+import { Injectable, Logger, Optional } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
+
+import { Prisma } from '@openathlete/database';
+
+import { AccountDeletingEvent } from 'src/events';
+import { AnalyticsService } from 'src/modules/analytics/analytics.service';
+import {
+  handOverClubLibrary,
+  releaseOwnedClubs,
+} from 'src/modules/club/club-ownership';
+import { PrismaService } from 'src/modules/prisma/services/prisma.service';
+import { StorageService } from 'src/modules/stored-files/storage.service';
+import { StripeService } from 'src/modules/subscription/services/stripe.service';
+
+type Tx = Prisma.TransactionClient;
+
+const ENDED_SUBSCRIPTION_STATUSES = new Set(['canceled', 'incomplete_expired']);
+
+/**
+ * Permanently deletes a user and everything they own (GDPR erasure).
+ *
+ * Most foreign keys restrict deletion, so rows are removed children first,
+ * in one transaction: either the whole account goes or nothing does. The
+ * account deletion integration test fails when the schema gains a foreign
+ * key that this service does not handle.
+ */
+@Injectable()
+export class AccountDeletionService {
+  private readonly logger = new Logger(AccountDeletionService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly stripeService: StripeService,
+    // Absent from the CLI, which loads no listeners
+    @Optional() private readonly eventEmitter?: EventEmitter2,
+    @Optional() private readonly analytics?: AnalyticsService,
+    // Absent from the CLI too: the daily cleanup then deletes the objects
+    // left without a row
+    @Optional() private readonly storage?: StorageService,
+  ) {}
+
+  async deleteAccount(userId: number): Promise<void> {
+    const user = await this.prisma.user.findUniqueOrThrow({
+      where: { userId },
+      select: {
+        analyticsConsentAt: true,
+        athlete: { select: { athleteId: true } },
+        subscription: {
+          select: { stripeSubscriptionId: true, status: true },
+        },
+      },
+    });
+
+    // Stop billing first: if Stripe fails, the account is kept so the
+    // deletion can be retried instead of leaving a paying ghost customer
+    const subscription = user.subscription;
+    if (
+      subscription?.stripeSubscriptionId &&
+      !ENDED_SUBSCRIPTION_STATUSES.has(subscription.status)
+    ) {
+      await this.stripeService.cancelSubscriptionNow(
+        subscription.stripeSubscriptionId,
+      );
+    }
+
+    const athleteId = user.athlete?.athleteId;
+
+    // Images before the rows that reference them: if the bucket fails, the
+    // account is kept and the deletion can be retried
+    if (this.storage?.isEnabled()) {
+      const files = await this.prisma.storedFile.findMany({
+        where: { ownerUserId: userId },
+        select: { key: true },
+      });
+      if (files.length > 0) {
+        await this.storage.delete(files.map((file) => file.key));
+      }
+    }
+
+    // Providers are told while the tokens still exist (Garmin requires it)
+    await this.eventEmitter?.emitAsync(
+      AccountDeletingEvent.SLUG,
+      new AccountDeletingEvent({ userId, athleteId }),
+    );
+
+    await this.prisma.$transaction(
+      async (tx) => {
+        // First, as it changes what the user owns: clubs pass to an admin
+        // or go (their library back to its authors), and what the user put
+        // in other clubs' libraries stays there. Memberships, group seats
+        // and their own groups cascade with the user.
+        await releaseOwnedClubs(tx, userId);
+        await handOverClubLibrary(tx, userId);
+
+        // Before the activities: each one would otherwise clear its records
+        // one by one
+        if (athleteId) {
+          await tx.record.deleteMany({ where: { athleteId } });
+        }
+
+        const templateEvents = await tx.eventTemplate.findMany({
+          where: { userId },
+          select: { eventId: true },
+        });
+        const athleteEvents = athleteId
+          ? await tx.event.findMany({
+              where: { athleteId },
+              select: { eventId: true },
+            })
+          : [];
+
+        // Templates are standalone copies of events, owned through the
+        // template rather than an athlete
+        await this.deleteEvents(tx, [
+          ...athleteEvents.map((event) => event.eventId),
+          ...templateEvents.map((template) => template.eventId),
+        ]);
+
+        if (athleteId) {
+          await this.deleteAthleteData(tx, athleteId);
+        }
+        await this.deleteUserData(tx, userId);
+
+        if (athleteId) {
+          await tx.athlete.delete({ where: { athleteId } });
+        }
+        // Messages, read receipts and thread memberships cascade, and so do
+        // the accesses given to AI agents (MCP) with their tokens and codes
+        await tx.user.delete({ where: { userId } });
+
+        await tx.messageThread.deleteMany({
+          where: { participants: { none: {} } },
+        });
+      },
+      { timeout: 60_000 },
+    );
+
+    this.logger.log(`Account deleted for user ${userId}`);
+    // After the fact, and read before: the consent went with the row
+    if (user.analyticsConsentAt)
+      this.analytics?.send(userId, 'account_deleted');
+  }
+
+  private async deleteEvents(tx: Tx, eventIds: number[]) {
+    if (eventIds.length === 0) return;
+    const inEvents = { eventId: { in: eventIds } };
+
+    const activities = await tx.eventActivity.findMany({
+      where: inEvents,
+      select: { eventActivityId: true },
+    });
+    const inActivities = {
+      eventActivityId: {
+        in: activities.map((activity) => activity.eventActivityId),
+      },
+    };
+
+    await tx.eventTemplate.deleteMany({ where: inEvents });
+    // Coaches' notices copy the activity name and RPE: the foreign key only
+    // clears event_id, which would leave those copies behind
+    await tx.activityChatNotice.deleteMany({ where: inEvents });
+
+    await tx.activityFeedbackQuestion.deleteMany({ where: inActivities });
+    await tx.activityFeedbackEmbedding.deleteMany({ where: inActivities });
+    await tx.eventActivityWeather.deleteMany({ where: inActivities });
+    await tx.eventActivityNormalizationFactor.deleteMany({
+      where: { normalization: inActivities },
+    });
+    await tx.eventActivityNormalization.deleteMany({ where: inActivities });
+    // Segments, training load entries and activity threads cascade
+    await tx.eventActivity.deleteMany({ where: inEvents });
+
+    // Workouts (steps, repeats, targets) cascade from their training
+    await tx.providerWorkoutExport.deleteMany({
+      where: { workout: { eventTraining: inEvents } },
+    });
+    await tx.eventTraining.deleteMany({ where: inEvents });
+    await tx.eventCompetition.deleteMany({ where: inEvents });
+    await tx.eventNote.deleteMany({ where: inEvents });
+
+    await tx.event.deleteMany({ where: { eventId: { in: eventIds } } });
+  }
+
+  private async deleteAthleteData(tx: Tx, athleteId: number) {
+    const ofAthlete = { athleteId };
+
+    await tx.trainingZoneValue.deleteMany({
+      where: { trainingZone: ofAthlete },
+    });
+    await tx.trainingZone.deleteMany({ where: ofAthlete });
+    await tx.equipment.deleteMany({ where: ofAthlete });
+    await tx.providerWorkoutExport.deleteMany({ where: ofAthlete });
+    await tx.providerAccount.deleteMany({ where: ofAthlete });
+    await tx.athleteSettings.deleteMany({ where: ofAthlete });
+    await tx.athleteInjury.deleteMany({ where: ofAthlete });
+    await tx.coachAthlete.deleteMany({ where: ofAthlete });
+    // Training weeks cascade from cycles; cycles only lose the athlete
+    await tx.cycle.deleteMany({ where: ofAthlete });
+    // Metrics, availability, training plans and load calculations cascade
+  }
+
+  private async deleteUserData(tx: Tx, userId: number) {
+    await tx.eventTemplateFolder.deleteMany({ where: { userId } });
+    await tx.token.deleteMany({ where: { userId } });
+    await tx.subscription.deleteMany({ where: { userId } });
+    // Agent messages and their blocks cascade
+    await tx.agentThread.deleteMany({ where: { userId } });
+    await tx.athleteInvitation.deleteMany({ where: { userId } });
+    await tx.coachInvitation.deleteMany({
+      where: { OR: [{ athleteUserId: userId }, { coachUserId: userId }] },
+    });
+    await tx.coachAthlete.deleteMany({ where: { userId } });
+    // Cascades too; said here so the list of what goes stays complete
+    await tx.lifecycleEmail.deleteMany({ where: { userId } });
+    // Cascades too; the exercises a coach created go with their account
+    await tx.customExercise.deleteMany({ where: { userId } });
+  }
+}

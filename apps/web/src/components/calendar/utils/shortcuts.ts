@@ -1,0 +1,126 @@
+/** Calendar keyboard shortcuts, by key */
+export type CalendarShortcut =
+  | 'today'
+  | 'previous'
+  | 'next'
+  | 'monthView'
+  | 'weekView'
+  | 'seasonView'
+  | 'help';
+
+const SHORTCUTS: Record<string, CalendarShortcut> = {
+  t: 'today',
+  ArrowLeft: 'previous',
+  ArrowRight: 'next',
+  m: 'monthView',
+  w: 'weekView',
+  s: 'seasonView',
+  '?': 'help',
+};
+
+/** Keys held while dragging or clicking a card change what it does */
+export const COPY_KEY = 'c';
+export const EDIT_KEY = 'e';
+
+const TYPING_TAGS = new Set(['INPUT', 'TEXTAREA', 'SELECT']);
+
+/** Widgets whose arrow keys already move inside them (tabs, lists, menus) */
+const ARROW_WIDGETS =
+  '[role="tablist"], [role="radiogroup"], [role="listbox"], [role="menu"], [role="slider"], [role="grid"]';
+
+/**
+ * The shortcut a key press triggers, or null: never while typing, with a
+ * modifier (browser and system shortcuts keep working), or over a dialog or
+ * menu (their own keys win).
+ */
+export function shortcutFor(
+  event: Pick<
+    KeyboardEvent,
+    'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'target' | 'repeat'
+  >,
+  overlayOpen: boolean,
+): CalendarShortcut | null {
+  // Autofill fires keyboard events without a key
+  if (!event.key) return null;
+  if (event.ctrlKey || event.metaKey || event.altKey || event.repeat) {
+    return null;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target && (TYPING_TAGS.has(target.tagName) || target.isContentEditable)) {
+    return null;
+  }
+  if (overlayOpen) return null;
+  if (event.key.startsWith('Arrow') && target?.closest?.(ARROW_WIDGETS)) {
+    return null;
+  }
+  const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
+  return SHORTCUTS[key] ?? null;
+}
+
+/**
+ * Ctrl+Z, or Cmd+Z on a Mac, outside text fields (they undo their own text)
+ * and dialogs. Shift+Cmd+Z stays the browser's redo.
+ */
+export function isUndoKey(
+  event: Pick<
+    KeyboardEvent,
+    'key' | 'ctrlKey' | 'metaKey' | 'altKey' | 'shiftKey' | 'target'
+  >,
+  overlayOpen: boolean,
+): boolean {
+  if (!event.key || event.key.toLowerCase() !== 'z') return false;
+  if (!(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) {
+    return false;
+  }
+  const target = event.target as HTMLElement | null;
+  if (target && (TYPING_TAGS.has(target.tagName) || target.isContentEditable)) {
+    return false;
+  }
+  return !overlayOpen;
+}
+
+/**
+ * A dialog, menu or list is open: it owns the keyboard. Radix keeps a closing
+ * one in the page for its exit animation, marked data-state="closed".
+ */
+export function isOverlayOpen(root: ParentNode = document): boolean {
+  return !!root.querySelector(
+    ['dialog', 'alertdialog', 'menu', 'listbox']
+      .map((role) => `[role="${role}"]:not([data-state="closed"])`)
+      .join(', '),
+  );
+}
+
+const held = new Set<string>();
+
+/** Tracks keys held down, for copy-on-drag and edit-on-click */
+export function trackHeldKeys(win: Window = window): () => void {
+  // Autofill fires keydown and keyup without a key
+  const down = (event: KeyboardEvent) => {
+    if (!event.key) return;
+    const target = event.target as HTMLElement | null;
+    if (
+      target &&
+      (TYPING_TAGS.has(target.tagName) || target.isContentEditable)
+    ) {
+      return;
+    }
+    held.add(event.key.toLowerCase());
+  };
+  const up = (event: KeyboardEvent) => {
+    if (event.key) held.delete(event.key.toLowerCase());
+  };
+  // Switching window while holding a key never fires its keyup
+  const clear = () => held.clear();
+  win.addEventListener('keydown', down);
+  win.addEventListener('keyup', up);
+  win.addEventListener('blur', clear);
+  return () => {
+    win.removeEventListener('keydown', down);
+    win.removeEventListener('keyup', up);
+    win.removeEventListener('blur', clear);
+    held.clear();
+  };
+}
+
+export const isKeyHeld = (key: string) => held.has(key);

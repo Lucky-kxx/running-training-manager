@@ -1,0 +1,23 @@
+{
+  "name": "@openathlete/eslint-config",
+  "version": "1.0.0",
+  "description": "OpenAthlete ESLint configuration",
+  "author": "Tristan Bouillot <tristan@tblt.fr>",
+  "license": "AGPL-3.0-only",
+  "main": "eslint.config.js",
+  "type": "module",
+  "scripts": {
+    "rimraf:node_modules": "sudo rm -rf node_modules"
+  },
+  "dependencies": {
+    "@eslint/js": "^9.39.5",
+    "@typescript-eslint/eslint-plugin": "^8.72.2",
+    "@typescript-eslint/parser": "^8.72.2",
+    "eslint-config-prettier": "^10.1.8",
+    "eslint-plugin-prettier": "^5.5.7",
+    "typescript-eslint": "^8.72.2"
+  },
+  "peerDependencies": {
+    "eslint": "^9.22.0"
+  }
+}

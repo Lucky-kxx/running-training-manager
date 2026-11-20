@@ -1,0 +1,219 @@
+'use client';
+
+import { useCurrentSubscription } from '@/api/subscription';
+import { PersonalThemeDialog } from '@/components/personal-theme/personal-theme-dialog';
+import { usePersonalTheme } from '@/components/personal-theme/personal-theme-provider';
+import { useInstallApp } from '@/components/pwa/use-install-app';
+import { Avatar, AvatarFallback } from '@/components/ui/avatar';
+import { Badge } from '@/components/ui/badge';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuGroup,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  useSidebar,
+} from '@/components/ui/sidebar';
+import { useAuthContext } from '@/contexts/auth';
+import { useLanguageSync } from '@/hooks/use-language-sync';
+import { m } from '@/paraglide/messages';
+import { getLocale } from '@/paraglide/runtime';
+import { getPath } from '@/routes/paths';
+import { SUPPORTED_LOCALES, getLocaleName } from '@/utils/locales';
+import { ChevronsUpDown, CogIcon, Download, LogOut } from 'lucide-react';
+import { useTheme } from 'next-themes';
+import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+
+import { SubscriptionPlan } from '@openathlete/shared';
+
+const planNameMap: Record<SubscriptionPlan, string> = {
+  [SubscriptionPlan.FREE]: m.plan_free_name(),
+  [SubscriptionPlan.SUPPORTER]: m.plan_supporter_name(),
+};
+
+export function NavUser() {
+  const { logout, user } = useAuthContext();
+  const { data: subscription } = useCurrentSubscription();
+  const navigate = useNavigate();
+  const { isMobile, setOpenMobile } = useSidebar();
+  const { theme, setTheme } = useTheme();
+  const personalTheme = usePersonalTheme();
+  const [themeEditorOpen, setThemeEditorOpen] = useState(false);
+  const { syncLanguage } = useLanguageSync();
+  const installApp = useInstallApp();
+
+  const handleNavigation = (path: string) => {
+    navigate(path);
+    // Close sidebar on mobile when navigating
+    if (isMobile) {
+      setOpenMobile(false);
+    }
+  };
+
+  if (!user) {
+    return null;
+  }
+
+  const fullName = `${user.firstName || ''} ${user.lastName || ''}`;
+  const initials =
+    `${user.firstName?.charAt(0) ?? ''}${user.lastName?.charAt(0) ?? ''}`.toUpperCase();
+  const currentPlan = subscription?.plan as SubscriptionPlan | undefined;
+  const planName =
+    currentPlan && subscription?.billingEnabled
+      ? planNameMap[currentPlan]
+      : null;
+  return (
+    <SidebarMenu>
+      <SidebarMenuItem>
+        <DropdownMenu>
+          <DropdownMenuTrigger asChild>
+            <SidebarMenuButton
+              size="lg"
+              className="data-[state=open]:bg-sidebar-accent data-[state=open]:text-sidebar-accent-foreground"
+            >
+              <Avatar className="h-8 w-8 rounded-lg">
+                <AvatarFallback className="rounded-lg">
+                  {initials}
+                </AvatarFallback>
+              </Avatar>
+              <div className="grid flex-1 text-left text-sm leading-tight">
+                <span className="truncate font-medium">{fullName}</span>
+                <span className="truncate text-xs">{user.email}</span>
+              </div>
+              <ChevronsUpDown className="ml-auto size-4" />
+            </SidebarMenuButton>
+          </DropdownMenuTrigger>
+          <DropdownMenuContent
+            className="w-(--radix-dropdown-menu-trigger-width) min-w-64 rounded-lg"
+            side={isMobile ? 'bottom' : 'right'}
+            align="end"
+            sideOffset={4}
+          >
+            <DropdownMenuLabel className="p-0 font-normal">
+              <div className="flex items-center gap-2 px-1 py-1.5 text-left text-sm">
+                <Avatar className="h-8 w-8 rounded-lg">
+                  <AvatarFallback className="rounded-lg">
+                    {initials}
+                  </AvatarFallback>
+                </Avatar>
+                <div className="grid flex-1 text-left text-sm leading-tight">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate font-medium">{fullName}</span>
+                    {planName && (
+                      <Badge variant="secondary" className="text-xs">
+                        {planName}
+                      </Badge>
+                    )}
+                  </div>
+                  <span className="truncate text-xs">{user.email}</span>
+                </div>
+              </div>
+            </DropdownMenuLabel>
+            <DropdownMenuSeparator />
+            <DropdownMenuGroup>
+              <DropdownMenuItem
+                onClick={() =>
+                  handleNavigation(getPath(['dashboard', 'settings']))
+                }
+              >
+                <CogIcon />
+                {m.settings()}
+              </DropdownMenuItem>
+              {installApp.available && (
+                <DropdownMenuItem onClick={installApp.install}>
+                  <Download />
+                  {m.pwa_install()}
+                </DropdownMenuItem>
+              )}
+            </DropdownMenuGroup>
+            <DropdownMenuGroup>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>{m.language()}</DropdownMenuSubTrigger>
+                <DropdownMenuPortal>
+                  <DropdownMenuSubContent>
+                    {SUPPORTED_LOCALES.map((lang) => (
+                      <DropdownMenuItem
+                        key={lang}
+                        className={getLocale() === lang ? 'font-bold' : ''}
+                        onClick={() => {
+                          syncLanguage(lang);
+                        }}
+                      >
+                        {getLocaleName(lang)}
+                      </DropdownMenuItem>
+                    ))}
+                  </DropdownMenuSubContent>
+                </DropdownMenuPortal>
+              </DropdownMenuSub>
+            </DropdownMenuGroup>
+            <DropdownMenuGroup>
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>{m.theme()}</DropdownMenuSubTrigger>
+                <DropdownMenuPortal>
+                  <DropdownMenuSubContent>
+                    {['light', 'dark', 'system'].map((themeOption) => (
+                      <DropdownMenuItem
+                        key={themeOption}
+                        className={
+                          !personalTheme?.current.active &&
+                          theme === themeOption
+                            ? 'font-bold'
+                            : ''
+                        }
+                        onClick={() => {
+                          personalTheme?.useStandardTheme();
+                          setTheme(themeOption);
+                        }}
+                      >
+                        {themeOption === 'light'
+                          ? m.theme_light()
+                          : themeOption === 'dark'
+                            ? m.theme_dark()
+                            : m.theme_system()}
+                      </DropdownMenuItem>
+                    ))}
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem
+                      className={
+                        personalTheme?.current.active ? 'font-bold' : ''
+                      }
+                      onSelect={() => setThemeEditorOpen(true)}
+                    >
+                      {m.theme_customize()}
+                    </DropdownMenuItem>
+                  </DropdownMenuSubContent>
+                </DropdownMenuPortal>
+              </DropdownMenuSub>
+            </DropdownMenuGroup>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem
+              onClick={() => {
+                logout((path) => navigate(path, { replace: true }));
+              }}
+            >
+              <LogOut />
+              {m.log_out()}
+            </DropdownMenuItem>
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {installApp.dialog}
+        <PersonalThemeDialog
+          open={themeEditorOpen}
+          onOpenChange={setThemeEditorOpen}
+        />
+      </SidebarMenuItem>
+    </SidebarMenu>
+  );
+}

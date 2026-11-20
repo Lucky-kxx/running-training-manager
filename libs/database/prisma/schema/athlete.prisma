@@ -1,0 +1,200 @@
+// ============================================================================
+// Athlete & Training Models
+// ============================================================================
+// Models related to athletes, their training zones, coach relationships,
+// and invitation systems for connecting athletes with coaches.
+// ============================================================================
+
+/// Athlete profile.
+/// Represents an athlete in the system. Each athlete is linked to a User account.
+/// Athletes can have training zones, records, equipment, training plans, and
+/// be coached by one or more coaches.
+model Athlete {
+  garminPersonalConnection GarminPersonalConnection?
+  // primary key
+  athleteId Int @id @default(autoincrement()) @map("athlete_id")
+
+  // fields
+  /// Random token of the athlete's calendar feed URL (iCal). Created on first
+  /// request, replaced to revoke the previous URL. Unique so a feed request
+  /// finds its athlete in one indexed read.
+  calendarFeedToken String? @unique @map("calendar_feed_token")
+
+  // relationships
+  user                     User                      @relation(fields: [userId], references: [userId])
+  userId                   Int                       @unique @map("user_id")
+  coachAthletes            CoachAthlete[]
+  events                   Event[]
+  trainingZones            TrainingZone[]
+  records                  Record[]
+  equipment                Equipment[]
+  cycles                   Cycle[]
+  metrics                  AthleteMetric[]
+  trainingLoadCalculations TrainingLoadCalculation[]
+  trainingPlans            TrainingPlan[]
+  availability             AthleteAvailability[]
+  providerAccounts         ProviderAccount[]
+  providerWorkoutExports   ProviderWorkoutExport[]
+  settings                 AthleteSettings?
+  coachAlertSettings       CoachActivityAlertSettings[]
+  injuries                 AthleteInjury[]
+  coachNotes               CoachNote[]
+  groupMemberships         AthleteGroupMember[]
+  metricThresholds         CoachMetricThreshold[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("athlete")
+}
+
+/// Coach-Athlete relationship.
+/// Links a coach (User with COACH role) to an athlete they are coaching.
+/// This enables coaches to view and manage their athletes' training data.
+model CoachAthlete {
+  // primary key
+  coachAthleteId Int @id @default(autoincrement()) @map("coach_athlete_id")
+
+  // fields
+
+  // relationships
+  user      User    @relation(fields: [userId], references: [userId])
+  userId    Int     @map("user_id")
+  athlete   Athlete @relation(fields: [athleteId], references: [athleteId])
+  athleteId Int     @map("athlete_id")
+  /// The club that created this link for its staff; null for a link the
+  /// coach and athlete made themselves. The club removes its own links when
+  /// the athlete or the coach leaves it.
+  club      Club?   @relation(fields: [clubId], references: [clubId], onDelete: Cascade)
+  clubId    Int?    @map("club_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([clubId])
+  @@map("coach_athlete")
+}
+
+/// Training zone value range.
+/// Defines the min/max values for a training zone for specific sports.
+/// A single TrainingZone can have multiple values (one per sport or shared).
+/// Used to categorize training intensity (e.g., Zone 1: 50-60% HRmax for running).
+model TrainingZoneValue {
+  // primary key
+  trainingZoneValueId Int @id @default(autoincrement()) @map("training_zone_value_id")
+
+  // fields
+  /// Minimum value for this zone (inclusive)
+  min    Float
+  /// Maximum value for this zone (inclusive)
+  max    Float
+  /// Sports this zone value applies to (empty array = all sports)
+  sports SportType[]
+
+  // relationships
+  trainingZone   TrainingZone @relation(fields: [trainingZoneId], references: [trainingZoneId])
+  trainingZoneId Int          @map("training_zone_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("training_zone_value")
+}
+
+/// Training zone definition.
+/// Represents a training intensity zone (e.g., Zone 1: Recovery, Zone 5: VO2max).
+/// Zones can be defined for different metrics: HEARTRATE, POWER, or PACE.
+/// Each zone has a name, description, color for visualization, and index for ordering.
+model TrainingZone {
+  // primary key
+  trainingZoneId Int @id @default(autoincrement()) @map("training_zone_id")
+
+  // fields
+  /// Zone name (e.g., "Recovery", "Endurance", "Threshold")
+  name        String
+  /// Human-readable description of the zone
+  description String
+  /// Zone index for ordering (0-based, typically 0-4 for 5 zones)
+  index       Int
+  /// Zone type: HEARTRATE, POWER, or PACE
+  type        TrainingZoneType
+  /// Hex color code for visualization (e.g., "#FF5733")
+  color       String
+
+  // relationships
+  athlete   Athlete             @relation(fields: [athleteId], references: [athleteId])
+  athleteId Int                 @map("athlete_id")
+  values    TrainingZoneValue[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("training_zone")
+}
+
+/// Athlete invitation.
+/// Used to invite someone to become an athlete. If the user doesn't exist,
+/// they receive an invitation token to create an account. If they exist,
+/// the invitation status tracks whether they've accepted.
+/// null status = auto-accept on account creation, PENDING = user exists and needs to accept.
+model AthleteInvitation {
+  // primary key
+  athleteInvitationId Int @id @default(autoincrement()) @map("athlete_invitation_id")
+
+  // fields
+  /// Email address of the invited athlete
+  email  String
+  /// Invitation token (null if user exists, set if user doesn't exist for account creation)
+  token  String?           @unique
+  /// Invitation status: null = auto-accept on account creation, PENDING = user exists and needs to accept, ACCEPTED, REJECTED
+  status InvitationStatus?
+
+  // relationships
+  user   User @relation(fields: [userId], references: [userId])
+  userId Int  @map("user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([token])
+  @@index([email])
+  @@index([status])
+  @@map("athlete_invitation")
+}
+
+/// Coach invitation.
+/// Used by athletes to invite coaches to their account. The invitation can be
+/// sent to an existing user (coachUserId set) or to a new user (token set for account creation).
+model CoachInvitation {
+  // primary key
+  coachInvitationId Int @id @default(autoincrement()) @map("coach_invitation_id")
+
+  // fields
+  /// Email address of the invited coach
+  email  String
+  /// Invitation token (null if user exists, set if user doesn't exist for account creation)
+  token  String?          @unique
+  /// Invitation status: PENDING (default), ACCEPTED, or REJECTED
+  status InvitationStatus @default(PENDING)
+
+  // relationships
+  athleteUser   User  @relation("CoachInvitationsSent", fields: [athleteUserId], references: [userId])
+  athleteUserId Int   @map("athlete_user_id")
+  coachUser     User? @relation("CoachInvitationsReceived", fields: [coachUserId], references: [userId])
+  coachUserId   Int?  @map("coach_user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([token])
+  @@index([email])
+  @@index([status])
+  @@index([coachUserId])
+  @@map("coach_invitation")
+}

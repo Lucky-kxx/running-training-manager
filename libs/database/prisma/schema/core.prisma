@@ -1,0 +1,283 @@
+// ============================================================================
+// Core User & Authentication Models
+// ============================================================================
+// Core authentication and user management models for the OpenAthlete platform.
+// Handles user accounts, roles, authentication tokens, and external provider
+// integrations (Strava, Garmin, etc.).
+// ============================================================================
+
+/// User account in the system.
+/// Represents a person who can have multiple roles (ATHLETE, COACH) and can
+/// be associated with an athlete profile, coach relationships, and subscriptions.
+/// Users authenticate via email/password and can connect external provider accounts.
+model User {
+  // primary key
+  userId Int @id @default(autoincrement()) @map("user_id")
+
+  // fields
+  /// User's email address (unique identifier for authentication)
+  email               String       @unique
+  /// Hashed password for authentication
+  password            String
+  /// User roles: ATHLETE (can have athlete profile), COACH (can coach athletes)
+  roles               UserRole[]
+  /// User's first name
+  firstName           String       @map("first_name")
+  /// User's last name
+  lastName            String       @map("last_name")
+  /// User's gender (optional)
+  gender              Gender?
+  /// Whether the user has completed the onboarding flow
+  onboardingCompleted Boolean      @default(false) @map("onboarding_completed")
+  /// How the user heard of OpenAthlete, asked during onboarding (optional)
+  acquisitionSource   AcquisitionSource? @map("acquisition_source")
+  /// Sports the athlete said they practise, asked during onboarding
+  practicedSports     SportType[]  @default([]) @map("practiced_sports")
+  /// What the athlete came for (optional)
+  trainingGoal        TrainingGoal? @map("training_goal")
+  /// Time the athlete can train each week (optional)
+  weeklyTrainingHours WeeklyTrainingHours? @map("weekly_training_hours")
+  /// How many athletes the coach follows (optional)
+  coachTeamSize       CoachTeamSize? @map("coach_team_size")
+  /// Token of the coach's shareable join link. Created on first request,
+  /// replaced to revoke the previous link.
+  coachJoinToken      String?      @unique @map("coach_join_token")
+  /// Campaign, referring site and website pages that led to the signup,
+  /// recorded once (see signupAttributionSchema)
+  signupAttribution   Json?        @map("signup_attribution")
+  /// User's preferred language (FR, EN, IT, ES, PT_BR or DE)
+  language            UserLanguage @default(FR)
+  /// Push notification token for mobile devices
+  pushToken           String?      @map("push_token")
+  /// IANA time zone of the user's device (e.g. Europe/Paris), set by the app
+  timeZone            String?      @map("time_zone")
+  /// Push the evening before planned training sessions
+  trainingReminders   Boolean      @default(true) @map("training_reminders")
+  /// Local date of the last evening reminded, so it goes out once
+  trainingReminderSentOn DateTime? @map("training_reminder_sent_on") @db.Date
+  /// What calendar cards and summaries show (see calendarDisplaySchema)
+  calendarDisplay     Json?        @map("calendar_display")
+  /// How the user set up their coach dashboard (columns)
+  coachDashboard      Json?        @map("coach_dashboard")
+  /// Tracks hidden from activity charts, per sport (see hiddenActivityTracksSchema)
+  hiddenActivityTracks Json?       @map("hidden_activity_tracks")
+  /// When the user dismissed the request to support the project
+  supportReminderDismissedAt DateTime? @map("support_reminder_dismissed_at")
+  /// How many times the request was dismissed: on the hosted instance it
+  /// comes back a few times, then stops
+  supportReminderDismissCount Int    @default(0) @map("support_reminder_dismiss_count")
+  /// When the app last showed a Supporter mention in context (race, year
+  /// review, AI preview), so they stay rare
+  supporterNudgeSeenAt DateTime?     @map("supporter_nudge_seen_at")
+  /// When the user allowed their data to be sent to third-party AI
+  /// providers; no AI runs on their data while unset (App Store 5.1.2(i), GDPR)
+  aiDataSharingConsentAt DateTime? @map("ai_data_sharing_consent_at")
+  /// When the user accepted product analytics; the API sends no event about
+  /// them while unset (GDPR)
+  analyticsConsentAt  DateTime?    @map("analytics_consent_at")
+  /// Onboarding tips and alerts about the account (sync stopped), by email
+  emailTips           Boolean      @default(true) @map("email_tips")
+  /// Monthly email recap of the training
+  emailRecap          Boolean      @default(true) @map("email_recap")
+  /// When the user asked for news about the project, Supporter included:
+  /// commercial emails need this consent (CNIL), unset by default
+  emailNewsConsentAt  DateTime?    @map("email_news_consent_at")
+
+  // relationships
+  athlete                   Athlete?
+  coachAthletes             CoachAthlete[]
+  tokens                    Token[]
+  templates                 EventTemplate[]
+  agentThreads              AgentThread[]
+  aiCredentials             AiCredential[]
+  aiModelPreferences        AiModelPreference[]
+  aiCustomInstructions      AiCustomInstruction[]
+  aiUsage                   AiUsage[]
+  eventTemplateFolder       EventTemplateFolder[]
+  athleteInvitations        AthleteInvitation[]
+  coachInvitationsSent      CoachInvitation[]          @relation("CoachInvitationsSent")
+  coachInvitationsReceived  CoachInvitation[]          @relation("CoachInvitationsReceived")
+  messageThreadParticipants MessageThreadParticipant[]
+  sentMessages              Message[]
+  messageReadReceipts       MessageReadReceipt[]
+  activityAlertSettings     CoachActivityAlertSettings[]
+  activityChatNotices        ActivityChatNotice[]
+  coachNotes                CoachNote[]
+  coachNotebook             CoachNotebook?
+  storedFiles               StoredFile[]
+  subscription              Subscription?
+  mcpGrants                 McpGrant[]
+  oauthCodes                OAuthAuthorizationCode[]
+  lifecycleEmails           LifecycleEmail[]
+  customExercises           CustomExercise[]
+  clubMemberships           ClubMember[]
+  ownedAthleteGroups        AthleteGroup[]
+  athleteGroupStaff         AthleteGroupStaff[]
+  scheduledMessages         ScheduledMessage[]
+  metricThresholds          CoachMetricThreshold[]
+  clubInvitationsSent       ClubInvitation[]
+  clubSessionsCreated       ClubSession[]
+  clubSessionAttendance     ClubSessionAttendance[]
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("user")
+}
+
+/// External provider account connection (Strava, Garmin, Suunto, etc.).
+/// Stores OAuth tokens and configuration for syncing activities and metrics
+/// from external platforms. Each athlete can have multiple provider accounts
+/// (one per provider type).
+model ProviderAccount {
+  // primary key
+  providerAccountId Int @id @default(autoincrement()) @map("provider_account_id")
+
+  // fields
+  /// External provider type (STRAVA, GARMIN, SUUNTO, COROS, POLAR, etc.)
+  provider                ConnectorProvider
+  /// OAuth access token for API requests
+  accessToken             String                @map("access_token")
+  /// OAuth refresh token for obtaining new access tokens
+  refreshToken            String?               @map("refresh_token")
+  /// When the access token expires (if applicable)
+  expiresAt               DateTime?             @map("expires_at")
+  /// OAuth scopes granted by the user
+  scopes                  String?
+  /// Account status: active (connected) or revoked (disconnected)
+  status                  ProviderAccountStatus @default(active)
+  /// External user ID from the provider (for webhook matching)
+  externalUserId          String?               @map("external_user_id")
+  /// OAuth client this account's tokens belong to, for providers that
+  /// register a client per connection (COROS)
+  oauthClientId           String?               @map("oauth_client_id")
+  /// Provider region holding this account, whose API serves it (COROS)
+  region                  String?
+  /// Whether to automatically import activities from this provider
+  importActivitiesEnabled Boolean               @default(true) @map("import_activities_enabled")
+  /// Whether to export planned workouts to this provider
+  exportWorkoutsEnabled   Boolean               @default(true) @map("export_workouts_enabled")
+  /// Whether to import health metrics (HRV, sleep, etc.) from this provider
+  importMetricsEnabled    Boolean               @default(false) @map("import_metrics_enabled")
+  /// Timestamp when a full historical import was requested
+  fullImportRequestedAt   DateTime?             @map("full_import_requested_at")
+  /// Timestamp when a full historical import was completed
+  fullImportCompletedAt   DateTime?             @map("full_import_completed_at")
+  /// Revoked from Settings by the user, as opposed to a connection that
+  /// broke (refused token, revoked at the provider), which they are told of
+  disconnectedByUser      Boolean               @default(false) @map("disconnected_by_user")
+  /// Writes OpenAthlete's analysis into the description of new activities
+  /// (Strava). Off for accounts connected before the feature: only a new
+  /// connection that grants write access starts with it on
+  activityDescriptionEnabled Boolean            @default(false) @map("activity_description_enabled")
+  /// Language of that analysis; null follows the user's language
+  activityDescriptionLanguage UserLanguage?     @map("activity_description_language")
+
+  // relationships
+  athlete   Athlete @relation(fields: [athleteId], references: [athleteId])
+  athleteId Int     @map("athlete_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([athleteId, provider])
+  @@index([externalUserId])
+  @@map("provider_account")
+}
+
+/// Tracks workout exports to external providers.
+/// When a workout is planned, it can be exported to connected providers (e.g., Garmin).
+/// This table tracks the export status, retry attempts, and any errors.
+model ProviderWorkoutExport {
+  // primary key
+  providerWorkoutExportId Int @id @default(autoincrement()) @map("provider_workout_export_id")
+
+  // fields
+  /// Athlete who owns the workout being exported
+  athleteId    Int                         @map("athlete_id")
+  /// Provider to which the workout is exported
+  provider     ConnectorProvider
+  /// Workout being exported
+  workoutId    Int                         @map("workout_id")
+  /// Planned date for the workout (stored as date-only; convention: midnight UTC)
+  plannedDate  DateTime                    @map("planned_date")
+  /// External ID assigned by the provider (if export succeeded)
+  externalId   String?                     @map("external_id")
+  /// Export status: pending, success, failed, or skipped
+  status       ProviderWorkoutExportStatus @default(pending)
+  /// Last synchronization timestamp
+  lastSyncAt   DateTime?                   @map("last_sync_at")
+  /// Number of export attempts (for retry logic)
+  attemptCount Int                         @default(0) @map("attempt_count")
+  /// Hash of workout content (to detect changes and avoid duplicate exports)
+  contentHash  String                      @map("content_hash")
+  /// Error code if export failed
+  errorCode    String?                     @map("error_code")
+  /// Human-readable error message if export failed
+  errorMessage String?                     @map("error_message")
+  /// Raw payload sent to provider (for debugging)
+  rawPayload   Json?                       @map("raw_payload")
+  /// Provider-specific schedule/plan ID (if applicable)
+  scheduleId   String?                     @map("schedule_id")
+
+  // relationships
+  athlete Athlete @relation(fields: [athleteId], references: [athleteId])
+  workout Workout @relation(fields: [workoutId], references: [workoutId])
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([athleteId, provider, workoutId, plannedDate])
+  @@index([status, plannedDate])
+  @@index([workoutId])
+  @@map("provider_workout_export")
+}
+
+/// Authentication and invitation tokens.
+/// Used for password resets, athlete invitations, and coach invitations.
+/// Tokens are single-use and expire after a set period.
+model Token {
+  // primary key
+  tokenId Int @id @default(autoincrement()) @map("token_id")
+
+  // fields
+  /// Unique token string (hashed)
+  token String    @unique
+  /// Token type: PASSWORD_RESET, ATHLETE_INVITATION, or COACH_INVITATION
+  type  TokenType
+
+  // relationships
+  user   User @relation(fields: [userId], references: [userId])
+  userId Int  @map("user_id")
+
+  // timestamps
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("token")
+}
+
+/// Emails of the onboarding, recap and news sequences already sent, so each
+/// goes out once (and so they stay spaced out)
+model LifecycleEmail {
+  // primary key
+  lifecycleEmailId Int @id @default(autoincrement()) @map("lifecycle_email_id")
+
+  // fields
+  kind   LifecycleEmailKind
+  /// What the email was about, when one kind can be sent more than once:
+  /// the month of a recap, the provider account of a lost connection
+  ref    String             @default("")
+  sentAt DateTime           @default(now()) @map("sent_at")
+
+  // relationships
+  user   User @relation(fields: [userId], references: [userId], onDelete: Cascade)
+  userId Int  @map("user_id")
+
+  @@unique([userId, kind, ref])
+  @@index([userId, sentAt])
+  @@map("lifecycle_email")
+}

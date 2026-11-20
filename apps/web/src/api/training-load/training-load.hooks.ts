@@ -1,0 +1,186 @@
+import {
+  MutationOptions,
+  QueryOptions,
+  useMutation,
+  useQuery,
+  useQueryClient,
+} from '@tanstack/react-query';
+
+import {
+  TrainingLoadAPI,
+  TrainingLoadCalculationType,
+} from './training-load.api';
+import {
+  invalidateTrainingLoadQueries,
+  trainingLoadKeys,
+} from './training-load.keys';
+
+export const useCalculateActivityLoadMutation = (
+  opt?: MutationOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.calculateActivityLoad>>,
+    Error,
+    {
+      activityId: number;
+      calculationType: TrainingLoadCalculationType;
+    }
+  >,
+) => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    ...opt,
+    mutationFn: ({ activityId, calculationType }) =>
+      TrainingLoadAPI.calculateActivityLoad(activityId, calculationType),
+    onSuccess: (data, variables, onMutateResult, context) => {
+      if (opt?.onSuccess)
+        opt.onSuccess(data, variables, onMutateResult, context);
+      // Invalidate all training load queries
+      invalidateTrainingLoadQueries(queryClient);
+    },
+  });
+};
+
+export const useTrainingLoadByPeriod = (
+  calculationType: TrainingLoadCalculationType,
+  startDate: Date,
+  endDate: Date,
+  athleteId?: number,
+  opt?: QueryOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.getTrainingLoadByPeriod>>
+  >,
+) =>
+  useQuery({
+    ...opt,
+    queryFn: () =>
+      TrainingLoadAPI.getTrainingLoadByPeriod(
+        calculationType,
+        startDate,
+        endDate,
+        athleteId,
+      ),
+    queryKey: [
+      trainingLoadKeys.getTrainingLoadByPeriod,
+      calculationType,
+      startDate.toISOString(),
+      endDate.toISOString(),
+      athleteId,
+    ],
+  });
+
+export const useTrainingLoadMetrics = (
+  calculationType: TrainingLoadCalculationType,
+  targetDate?: Date,
+  athleteId?: number,
+  opt?: QueryOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.getTrainingLoadMetrics>>
+  >,
+) =>
+  useQuery({
+    ...opt,
+    queryFn: () =>
+      TrainingLoadAPI.getTrainingLoadMetrics(
+        calculationType,
+        targetDate,
+        athleteId,
+      ),
+    queryKey: [
+      trainingLoadKeys.getTrainingLoadMetrics,
+      calculationType,
+      targetDate?.toISOString(),
+      athleteId,
+    ],
+  });
+
+export const useWeeklyLoadSummaryQuery = (
+  startDate?: Date,
+  endDate?: Date,
+  athleteId?: number,
+  enabled?: boolean,
+  opt?: QueryOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.getWeeklyLoadSummary>>
+  >,
+) =>
+  useQuery({
+    ...opt,
+    enabled:
+      (enabled ?? true) && Boolean(startDate && endDate) && Boolean(athleteId),
+    queryFn: () => {
+      if (!startDate || !endDate) {
+        return Promise.resolve([]);
+      }
+      return TrainingLoadAPI.getWeeklyLoadSummary(
+        startDate,
+        endDate,
+        athleteId,
+      );
+    },
+    queryKey: [
+      trainingLoadKeys.getWeeklyLoadSummary,
+      startDate?.toISOString(),
+      endDate?.toISOString(),
+      athleteId,
+    ],
+  });
+
+export const useActivityTrainingLoads = (
+  activityId: number,
+  opt?: QueryOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.getActivityTrainingLoads>>
+  >,
+) =>
+  useQuery({
+    ...opt,
+    queryFn: () => TrainingLoadAPI.getActivityTrainingLoads(activityId),
+    queryKey: [trainingLoadKeys.getActivityTrainingLoads, activityId],
+  });
+
+export const useRecalculateAllLoadsMutation = (
+  opt?: MutationOptions<
+    Awaited<ReturnType<typeof TrainingLoadAPI.recalculateAllLoads>>,
+    Error,
+    {
+      calculationType: TrainingLoadCalculationType;
+    }
+  >,
+) => {
+  const queryClient = useQueryClient();
+  return useMutation({
+    ...opt,
+    mutationFn: ({ calculationType }) =>
+      TrainingLoadAPI.recalculateAllLoads(calculationType),
+    onSuccess: (data, variables, onMutateResult, context) => {
+      if (opt?.onSuccess)
+        opt.onSuccess(data, variables, onMutateResult, context);
+      invalidateTrainingLoadQueries(queryClient);
+    },
+  });
+};
+
+/**
+ * Day by day load and form of a calendar range, with the wellness
+ * measurements only when the athlete records some (`wellness`).
+ */
+export const useDailyFormQuery = ({
+  startDate,
+  endDate,
+  athleteId,
+  wellness,
+  enabled = true,
+}: {
+  startDate?: Date;
+  endDate?: Date;
+  athleteId?: number;
+  wellness: boolean;
+  enabled?: boolean;
+}) =>
+  useQuery({
+    enabled: enabled && Boolean(startDate && endDate && athleteId),
+    queryFn: () =>
+      TrainingLoadAPI.getDailyForm(startDate!, endDate!, athleteId, wellness),
+    queryKey: [
+      trainingLoadKeys.getDailyForm,
+      startDate?.toISOString(),
+      endDate?.toISOString(),
+      athleteId,
+      wellness,
+    ],
+  });
